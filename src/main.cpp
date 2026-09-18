@@ -6,6 +6,7 @@
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
 #include <Preferences.h>
+#include <RecoveryBoot.h>
 #include "sd_backup.h"
 
 #include "config.h"
@@ -178,6 +179,31 @@ static void updateScreen() {
 }
 
 void setup() {
+  // ---------------------------------------------------------------------------
+  // Recovery hatch — MUST stay the first statement in setup().
+  //
+  // The stock second-stage bootloader cannot read buttons, so a "hold a combo at
+  // reset to escape" check can only be honoured by the firmware that boots. Held
+  // at reset, Back + Up either flashes /update.bin from the SD card into the
+  // next OTA slot, or — with no update file present — repoints otadata at ota_0
+  // and reboots into the recovery firmware (Escape Hatch) living there.
+  //
+  // On a USB-locked X4 this is the ONLY way back out of this firmware. Do not
+  // move it below display.begin(), and do not make it conditional.
+  //
+  // Safe to call unconditionally: it returns immediately unless the combo is
+  // held, ota_0 holds a valid app image, and we are not already running from
+  // ota_0. When it acts, it reboots and never returns.
+  // ---------------------------------------------------------------------------
+  {
+    freeink::recovery::SdUpdateOptions recovery;
+    recovery.path = "/update.bin";
+    recovery.renameOnSuccess = true;  // so holding the combo through the
+                                      // post-flash reset can't reflash the
+                                      // same image in a loop
+    freeink::recovery::checkBootCombo(recovery);
+  }
+
   DBG_INIT();
   DBG_PRINTLN("MicroSlate starting...");
 
