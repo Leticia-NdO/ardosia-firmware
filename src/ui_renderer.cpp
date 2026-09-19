@@ -10,6 +10,7 @@
 #include <HalDisplay.h>
 #include <EpdFont.h>
 #include <EpdFontFamily.h>
+#include <esp_system.h>   // esp_reset_reason() — boot diagnostics in the footer
 
 // External variables
 extern bool autoReconnectEnabled;
@@ -152,6 +153,31 @@ static void drawBattery(GfxRenderer& renderer, HalGPIO& gpio) {
   drawRightText(renderer, FONT_SMALL, renderer.getScreenWidth() - 8, 5, buf, !darkMode);
 }
 
+// Helper: why did the device last restart?
+//
+// There is no serial console on a USB-locked X4, so this is the only way to tell a
+// software panic apart from a brownout or a watchdog — three failures with three
+// completely different fixes. Shown in the main-menu footer.
+//   PANIC    -> crash in code (stack overflow, null deref, assert)
+//   TASK_WDT -> a task blocked too long without yielding
+//   BROWNOUT -> supply sagged, typically when the radio starts transmitting
+//   SW       -> deliberate esp_restart() (our recovery hatch does this)
+static const char* resetReasonStr() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "RST:POWERON";
+    case ESP_RST_EXT:       return "RST:EXT";
+    case ESP_RST_SW:        return "RST:SW";
+    case ESP_RST_PANIC:     return "RST:PANIC";
+    case ESP_RST_INT_WDT:   return "RST:INT_WDT";
+    case ESP_RST_TASK_WDT:  return "RST:TASK_WDT";
+    case ESP_RST_WDT:       return "RST:WDT";
+    case ESP_RST_DEEPSLEEP: return "RST:DEEPSLEEP";
+    case ESP_RST_BROWNOUT:  return "RST:BROWNOUT";
+    case ESP_RST_SDIO:      return "RST:SDIO";
+    default:                return "RST:UNKNOWN";
+  }
+}
+
 // Helper: draw BLE status
 static void drawBleStatus(GfxRenderer& renderer, int x, int y) {
   const char* status = "";
@@ -194,11 +220,42 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   }
 
   // Footer
-  constexpr int bm = 60;
+  // Footer holds four lines while the boot diagnostics are in: hints, BLE state +
+  // reset reason, and the boot history. 60px fit two; 88 fits four with margin.
+  // Shrink this back to 60 when the diagnostics come out.
+  constexpr int bm = 108;  // five lines while crash diagnostics are in
   if (sh > bm + 40) {
     clippedLine(renderer, 10, sh - bm, sw - 10, sh - bm, tc);
-    drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 12, "Arrows: Navigate  Enter: Select", 0, tc);
-    drawBleStatus(renderer, 20, sh - bm + 28);
+    drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 10, "Arrows: Navigate  Enter: Select", 0, tc);
+    drawBleStatus(renderer, 20, sh - bm + 30);
+    // Last reset cause — the only crash diagnostic available without a serial console.
+    {
+      // RST:SW alone is ambiguous — append which restart site claimed it, when known.
+      extern char lastRebootTag[];
+      char rstBuf[40];
+      if (lastRebootTag[0])
+        snprintf(rstBuf, sizeof(rstBuf), "%s/%s", resetReasonStr(), lastRebootTag);
+      else
+        snprintf(rstBuf, sizeof(rstBuf), "%s", resetReasonStr());
+      drawRightText(renderer, FONT_SMALL, sw - 10, sh - bm + 30, rstBuf, tc);
+      // Boot history: oldest first. "?" = that boot was diverted to the Escape
+      // Hatch by the recovery combo; "!" = it reached the app normally.
+      extern char bootHistory[];
+      if (bootHistory[0])
+        drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 52, bootHistory, sw - 40, tc);
+      {
+        // Faulting task @ program counter from the last core dump, when there is one.
+        extern char crashInfo[];
+        if (crashInfo[0])
+          drawClippedText(renderer, FONT_SMALL, 20, sh - bm + 70, crashInfo, sw - 40, tc);
+      }
+      {
+        extern char lastCrumb[];
+        char crumbBuf[24];
+        snprintf(crumbBuf, sizeof(crumbBuf), "BLE:%s", lastCrumb[0] ? lastCrumb : "-");
+        drawRightText(renderer, FONT_SMALL, sw - 10, sh - bm + 52, crumbBuf, tc);
+      }
+    }
   }
   drawBattery(renderer, gpio);
 
@@ -643,7 +700,7 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
 
     char headerStr[64];
     snprintf(headerStr, sizeof(headerStr), "Available devices: %d", deviceCount);
-    drawClippedText(renderer, FONT_SMALL, 10, 70, headerStr, 0, tc, EpdFontFamily::BOLD);
+    drawClippedText(renderer, FONT_SMALL, 10, 72, headerStr, 0, tc, EpdFontFamily::BOLD);
 
     // Show up to 10 devices (pagination via scrolling)
     int maxDevicesToShow = 10;
@@ -656,7 +713,7 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
 
     for (int i = 0; i < devicesToShow; i++) {
       int deviceIndex = startIndex + i;
-      int yPos = 90 + (i * 30);
+      int yPos = 104 + (i * 30);
 
       // Stop drawing if we'd go into the footer zone
       if (yPos > sh - 100) break;
@@ -668,14 +725,26 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
                                 ? devices[deviceIndex].address.c_str()
                                 : devices[deviceIndex].name.c_str();
 
+      // Tag what the advertising payload says this thing is, so a keyboard is
+      // distinguishable from the phones and earbuds a scan also picks up.
+      const uint16_t app = devices[deviceIndex].appearance;
+      const char* kindTag = "";
+      if (app == BLE_APPEARANCE_KEYBOARD)                 kindTag = "[KBD] ";
+      else if (app == BLE_APPEARANCE_MOUSE)               kindTag = "[MOU] ";
+      else if ((app >> 6) == BLE_APPEARANCE_CAT_HID)      kindTag = "[HID] ";
+      else if (devices[deviceIndex].isHid)                kindTag = "[HID] ";
+
+      char deviceLabel[96];
+      snprintf(deviceLabel, sizeof(deviceLabel), "%s%s", kindTag, displayName);
+
       // Available width: leave room for RSSI on the right (~80px)
       int nameMaxW = sw - 100;
 
       if (isSelected || isConnected) {
         clippedFillRect(renderer, 5, yPos - 5, sw - 10, 25, tc);
-        drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, !tc);
+        drawClippedText(renderer, FONT_UI, 15, yPos, deviceLabel, nameMaxW, !tc);
       } else {
-        drawClippedText(renderer, FONT_UI, 15, yPos, displayName, nameMaxW, tc);
+        drawClippedText(renderer, FONT_UI, 15, yPos, deviceLabel, nameMaxW, tc);
       }
 
       // RSSI on the right
@@ -690,7 +759,7 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
       int pageNum = (bluetoothDeviceSelection / maxDevicesToShow) + 1;
       int totalPages = (deviceCount + maxDevicesToShow - 1) / maxDevicesToShow;
       snprintf(navHint, sizeof(navHint), "Page %d/%d", pageNum, totalPages);
-      int navY = 90 + (devicesToShow * 30);
+      int navY = 104 + (devicesToShow * 30);
       if (navY < sh - 100)
         drawClippedText(renderer, FONT_SMALL, 15, navY, navHint, 0, tc);
     }

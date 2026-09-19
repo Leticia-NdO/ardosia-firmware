@@ -61,6 +61,22 @@ static uint32_t currentPasskey = 0;
 
 // Forward declarations
 static bool setupHidConnection();
+
+// --- Connect-path breadcrumb -------------------------------------------------
+// Something calls esp_restart() partway through the BLE connect and it is not
+// application code, so we need to know how far the task gets before dying.
+// RTC slow memory survives a software reset (it only clears on a cold power-on),
+// costs nothing to write, and unlike NVS does not wear the flash.
+//
+// Read back as "BLE:<n>" in the main-menu footer:
+//   1 task entered        4 security attempted
+//   2 about to connect()  5 about to set up HID
+//   3 link established    6 HID ready — keyboard usable
+// A footer showing BLE:3 means the device died between link-up and security.
+
+void logCrumb(const char* tag);   // main.cpp — persists to NVS
+
+static inline void crumb(const char* tag) { logCrumb(tag); }
 int getLastUsedKeyboardIndex();
 
 // Helper: upsert device into discovered list
@@ -163,6 +179,18 @@ static class ScanCallbacks : public NimBLEScanCallbacks {
     info.rssi = dev->getRSSI();
     info.addressType = dev->getAddress().getType();
     info.lastSeenMs = millis();
+
+    // Classify the device from its advertising payload so the UI can tell a
+    // keyboard apart from the phones, earbuds and wearables that also show up
+    // in a scan. Active scan is on, so scan-response data is folded in here too.
+    //
+    // Neither signal is guaranteed: some keyboards only expose 0x1812 after
+    // connecting, and appearance is optional. So this MARKS devices, it must
+    // never be used to hide them — a filtered-out keyboard is unrecoverable
+    // from the UI.
+    info.isHid = dev->isAdvertisingService(NimBLEUUID((uint16_t)0x1812));
+    info.appearance = dev->getAppearance();  // 0 when not advertised
+
     upsertDevice(info);
     extern bool screenDirty;
     screenDirty = true;
@@ -346,6 +374,7 @@ static bool setupHidConnection() {
 // --- FreeRTOS task: runs connect + security + HID setup off the main loop ---
 
 static void bleConnectTask(void* param) {
+  crumb("T1");
   bleState = BLEState::CONNECTING;
   authSuccess = false;
 
@@ -374,10 +403,23 @@ static void bleConnectTask(void* param) {
 
   // Step 1: Connect (blocks this task, main loop continues)
   NimBLEAddress addr(keyboardAddress, keyboardAddressType);
-  // Delete any stored bond before connecting — forces a fresh "Just Works" pairing
-  // instead of an encrypted reconnect. Prevents a NimBLE security-state crash when
-  // the keyboard still holds a stale connection from a previous unclean disconnect.
-  NimBLEDevice::deleteBond(addr);
+  // DISABLED FOR DIAGNOSIS — upstream had:
+  //     NimBLEDevice::deleteBond(addr);
+  // here, to force a fresh "Just Works" pairing instead of an encrypted
+  // reconnect, working around a NimBLE security-state crash when the keyboard
+  // still holds a stale connection.
+  //
+  // But a core dump of the connect-time panic points at xTaskGenericNotify in
+  // the "ble" host task, asserting on a null task handle — the signature of two
+  // host operations racing over the same sync block. deleteBond() calls
+  // ble_gap_unpair(), which queues work on that very task, and it sits one line
+  // before the connect() that dies. On a device that has never paired there is
+  // also no bond to delete, so this call can only cost us.
+  //
+  // If the panic disappears, this was it, and the right long-term fix is to call
+  // deleteBond only when a bond actually exists, well away from connect().
+  // If the panic persists, put this line straight back.
+  crumb("T2");
   if (!pClient->connect(addr, true)) {
     DBG_PRINTLN("[BLE-Task] Connection failed");
     bleState = BLEState::DISCONNECTED;
@@ -386,10 +428,12 @@ static void bleConnectTask(void* param) {
     return;
   }
 
+  crumb("T3");
   DBG_PRINTLN("[BLE-Task] Connected, attempting security...");
 
   // Step 2: Try security pairing (optional for some keyboards)
   // If this fails, we'll still try HID setup in case the keyboard doesn't require auth
+  crumb("T4");
   bool secureAttempted = pClient->secureConnection();
 
   if (secureAttempted) {
@@ -408,6 +452,7 @@ static void bleConnectTask(void* param) {
     DBG_PRINTLN("[BLE-Task] secureConnection() returned false - trying HID anyway");
   }
 
+  crumb("T5");
   DBG_PRINTLN("[BLE-Task] Setting up HID...");
 
   // Step 4: Service discovery + HID subscription (blocks this task)
@@ -427,6 +472,7 @@ static void bleConnectTask(void* param) {
   reconnectDelay = 5000;  // Reset backoff after successful connection
   bleConnIdleMode = false;
   lastBleKeystrokeMs = millis();  // Start the 3s idle timer from now, not from boot
+  crumb("OK");
   DBG_PRINTLN("[BLE-Task] Keyboard ready!");
 
   // NOTE: updateConnParams() is intentionally NOT called here.  Calling it immediately
@@ -479,7 +525,12 @@ static void startConnectTask() {
   // 20480 bytes: Logitech has a complex service tree (keyboard + media + battery reports
   // + many descriptors). NimBLE 2.x uses more per-call stack than 1.4.x — 12288 was
   // sufficient before but overflows during full service discovery on the Logitech.
-  xTaskCreate(bleConnectTask, "ble_conn", 20480, NULL, 1, &connectTaskHandle);
+  //
+  // Raised to 32768 in this fork: a keyboard with a heavier service tree still panicked
+  // during discovery at 20480. The device has ~200 KB of free heap at this point, so the
+  // extra 12 KB is cheap insurance. If RAM ever gets tight, this is a safe thing to trim
+  // back — but re-test discovery against the fattest keyboard available first.
+  xTaskCreate(bleConnectTask, "ble_conn", 32768, NULL, 1, &connectTaskHandle);
 }
 
 // --- NVS multi-keyboard helpers ---
@@ -581,7 +632,19 @@ void bleSetup() {
   // DISPLAY_YESNO: we can show a number and confirm — lets keyboards that *do* want
   // numeric comparison (Apple Magic Keyboard, etc.) initiate it while still falling
   // back to "Just Works" for keyboards that don't need it.
-  NimBLEDevice::setSecurityAuth(true, false, false);
+  // setSecurityAuth(bonding, mitm, secureConnections)
+  //
+  // Upstream had secureConnections = false, which offers only Legacy Pairing
+  // (Bluetooth 4.0). Keyboards advertising as BT 5.0 often require LE Secure
+  // Connections and refuse Legacy outright: the GAP link comes up, pairing is
+  // rejected, and the code below carries on regardless ("trying HID anyway").
+  // The device then reports "Connected to keyboard" while the keyboard itself
+  // stays in pairing mode, unbonded, sending nothing — and Paired Keyboards
+  // stays empty because there is no bond to store.
+  //
+  // MITM stays false: with IO capability NO_INPUT_OUTPUT the device cannot do
+  // passkey entry anyway, so this is Just Works either way — now over SC.
+  NimBLEDevice::setSecurityAuth(true, false, true);
   // NO_INPUT_OUTPUT = "Just Works" pairing — works for both Logitech and Keychron
   // since MITM=false means we never require authenticated pairing regardless of IO cap.
   // DISPLAY_YESNO was tried for Keychron but broke Logitech (bond/security-state mismatch
@@ -591,7 +654,18 @@ void bleSetup() {
   // and which caused bond-validation failures after the security param change.
   NimBLEDevice::setSecurityInitKey(BLE_SM_PAIR_KEY_DIST_ENC);
   NimBLEDevice::setSecurityRespKey(BLE_SM_PAIR_KEY_DIST_ENC);
-  NimBLEDevice::setPower(-9);  // -9dBm — lowest verified working power level
+  // TX power. Upstream ran at -9 dBm, described as the "lowest verified working
+  // power level" — i.e. tuned downward for battery life against the author's own
+  // keyboards at the author's own desk. About an eighth of a milliwatt: fine at
+  // arm's length in clear air, marginal the moment a hand, a body or 2.4GHz
+  // traffic gets in the way. A link sitting at the edge drops, auto-reconnect
+  // brings it back, and it drops again — the connect/disconnect loop.
+  //
+  // DIAGNOSTIC VALUE: +9 dBm, the maximum, to confirm whether link margin is the
+  // cause. Do NOT keep this. Once stability is confirmed, walk it back (3, then
+  // 0, then -3) and settle on the lowest value that stays solid in real use —
+  // radio power is a real share of the battery budget on this device.
+  NimBLEDevice::setPower(9);
 
   prefs.begin("ble_kb", false);
 
@@ -656,6 +730,7 @@ void bleLoop() {
   // Launch connect task if requested (non-blocking)
   if (connectToKeyboard && bleState != BLEState::CONNECTED && connectTaskHandle == nullptr) {
     connectToKeyboard = false;
+    crumb("ST");
     startConnectTask();
     return;
   }
@@ -738,16 +813,20 @@ BleDeviceInfo* getDiscoveredDevices() {
 }
 
 void connectToDevice(int deviceIndex) {
+  crumb("UI1");
   if (deviceIndex < 0 || deviceIndex >= (int)discoveredDevices.size()) {
     DBG_PRINTLN("[BLE] Invalid device index");
     return;
   }
 
+  crumb("UI2");
   stopDeviceScan();
+  crumb("UI3");
 
   if (pClient && pClient->isConnected()) {
     pClient->disconnect();
   }
+  crumb("UI4");
 
   keyboardAddress = discoveredDevices[deviceIndex].address;
   keyboardAddressType = discoveredDevices[deviceIndex].addressType;

@@ -33,3 +33,16 @@ CONFIG_BT_CTRL_LPCLK_SEL_MAIN_XTAL=y
 #
 CONFIG_ESP_PHY_MAC_BB_PD=y
 
+
+#
+# Core dump to flash — the only way to get a crash backtrace off a USB-locked
+# device. The partition table already reserves a 64KB `coredump` partition, it
+# just was not being written. On the next boot after a panic the firmware reads
+# the summary (faulting task + program counter) and shows it in the footer; run
+# addr2line against firmware.elf to turn the PC into a source line.
+#
+CONFIG_ESP_COREDUMP_ENABLE=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
+CONFIG_ESP_COREDUMP_CHECKSUM_SHA256=y
+CONFIG_ESP_COREDUMP_STACK_SIZE=1024

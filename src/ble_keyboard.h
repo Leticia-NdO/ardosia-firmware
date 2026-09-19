@@ -10,7 +10,15 @@ struct BleDeviceInfo {
   int rssi;
   uint8_t addressType;    // BLE address type (public/random)
   uint32_t lastSeenMs;    // from millis()
+  bool isHid;             // advertises the HID-over-GATT service (0x1812)
+  uint16_t appearance;    // GAP appearance; 0x03C1 = Keyboard, 0 = not advertised
 };
+
+// GAP appearance values worth naming (Bluetooth Assigned Numbers).
+static constexpr uint16_t BLE_APPEARANCE_KEYBOARD = 0x03C1;
+static constexpr uint16_t BLE_APPEARANCE_MOUSE    = 0x03C2;
+// The HID category is the top 10 bits: 0x03C0 >> 6 == 0x0F.
+static constexpr uint16_t BLE_APPEARANCE_CAT_HID  = 0x0F;
 
 void bleSetup();
 void bleLoop();

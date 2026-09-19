@@ -5,6 +5,7 @@
 #include <esp_pm.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
+#include <esp_core_dump.h>
 #include <Preferences.h>
 #include <RecoveryBoot.h>
 #include "sd_backup.h"
@@ -39,6 +40,141 @@ HalGPIO gpio;
 
 // --- Persistent settings (NVS) ---
 static Preferences uiPrefs;
+
+// --- Reboot provenance -------------------------------------------------------
+// esp_reset_reason() reports RST:SW for EVERY deliberate restart, so it cannot
+// tell "the 5s BACK handler fired" apart from "the Escape Hatch sent us here".
+// On a USB-locked device with no serial console that ambiguity is expensive, so
+// each restart site stamps its own tag in NVS on the way out, and the next boot
+// reads it back into lastRebootTag for the footer.
+char lastRebootTag[24] = "";
+
+void logRebootReason(const char* tag) {
+  Preferences p;
+  if (p.begin("diag", false)) {
+    p.putString("why", tag);
+    p.end();
+  }
+}
+
+// --- Boot history -----------------------------------------------------------
+// Reading the footer requires walking back through the Escape Hatch, whose "Boot
+// Other Slot" calls esp_restart() — so by the time the screen is visible,
+// esp_reset_reason() only ever reports SW and the original cause is gone. Fix:
+// record each boot's reason in NVS BEFORE anything can restart us, and keep a
+// short history.
+//
+// Each entry is <reason><mark>, where the mark is:
+//   ?  this boot never got past the recovery hatch — checkBootCombo() diverted
+//      it to the Escape Hatch, which means the Back+Up combo read as held
+//   !  this boot survived the hatch and reached the app
+//
+// So "BRN? SW!" reads as: a brownout reboot that the combo then intercepted,
+// followed by a deliberate restart that came up normally.
+//
+// This writes to NVS twice per boot. It is a debugging aid — drop it once the
+// BLE connect crash is understood, rather than leaving it wearing the flash.
+char bootHistory[64] = "";
+
+static const char* reasonAbbrev() {
+  switch (esp_reset_reason()) {
+    case ESP_RST_POWERON:   return "PWR";
+    case ESP_RST_EXT:       return "EXT";
+    case ESP_RST_SW:        return "SW";
+    case ESP_RST_PANIC:     return "PAN";
+    case ESP_RST_INT_WDT:   return "IWD";
+    case ESP_RST_TASK_WDT:  return "TWD";
+    case ESP_RST_WDT:       return "WDT";
+    case ESP_RST_DEEPSLEEP: return "DSL";
+    case ESP_RST_BROWNOUT:  return "BRN";
+    default:                return "UNK";
+  }
+}
+
+// Called BEFORE checkBootCombo(). Appends "<reason>?" to the history.
+static void bootHistoryAppend() {
+  Preferences p;
+  if (!p.begin("diag", false)) return;
+  String h = p.getString("hist", "");
+  h += reasonAbbrev();
+  h += "? ";
+  while (h.length() > 40) {           // keep only the recent tail
+    int sp = h.indexOf(' ');
+    if (sp < 0) break;
+    h = h.substring(sp + 1);
+  }
+  p.putString("hist", h);
+  snprintf(bootHistory, sizeof(bootHistory), "%s", h.c_str());
+  p.end();
+}
+
+// Called AFTER checkBootCombo() returned — i.e. the hatch did NOT divert us.
+// Flips this boot's trailing '?' to '!'.
+static void bootHistoryConfirm() {
+  Preferences p;
+  if (!p.begin("diag", false)) return;
+  String h = p.getString("hist", "");
+  int q = h.lastIndexOf('?');
+  if (q >= 0) {
+    h.setCharAt(q, '!');
+    p.putString("hist", h);
+    snprintf(bootHistory, sizeof(bootHistory), "%s", h.c_str());
+  }
+  p.end();
+}
+
+// Breadcrumb in NVS. The RTC-memory version read back as 0 even when the code
+// had clearly run, so trust the storage that demonstrably works instead.
+char lastCrumb[16] = "";
+
+void logCrumb(const char* tag) {
+  Preferences p;
+  if (p.begin("diag", false)) {
+    p.putString("crumb", tag);
+    p.end();
+  }
+}
+
+// Pull the faulting task and program counter out of the core dump the panic
+// handler wrote to flash. This is the closest thing to a backtrace available
+// without a serial console: feed the PC to
+//   xtensa-esp32-elf-addr2line -pfiaC -e .pio/build/xteink_x4/firmware.elf <pc>
+// (riscv32-esp-elf-addr2line on the C3) to get file:line.
+// The image is erased after reading so a stale crash cannot masquerade as a new
+// one.
+char crashInfo[40] = "";
+
+static void readCoreDump() {
+  if (esp_core_dump_image_check() != ESP_OK) return;
+  esp_core_dump_summary_t* sum =
+      (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
+  if (!sum) return;
+  if (esp_core_dump_get_summary(sum) == ESP_OK) {
+    snprintf(crashInfo, sizeof(crashInfo), "%s@%08lx",
+             sum->exc_task, (unsigned long)sum->exc_pc);
+  }
+  free(sum);
+  esp_core_dump_image_erase();
+}
+
+static void readCrumb() {
+  Preferences p;
+  if (!p.begin("diag", false)) return;
+  String c = p.getString("crumb", "");
+  snprintf(lastCrumb, sizeof(lastCrumb), "%s", c.c_str());
+  p.end();
+}
+
+static void readAndClearRebootReason() {
+  Preferences p;
+  if (!p.begin("diag", false)) return;
+  String why = p.getString("why", "");
+  if (why.length() > 0) {
+    snprintf(lastRebootTag, sizeof(lastRebootTag), "%s", why.c_str());
+    p.remove("why");   // one-shot: don't let a stale tag explain a later boot
+  }
+  p.end();
+}
 
 // --- Shared UI state ---
 UIState currentState = UIState::MAIN_MENU;
@@ -134,6 +270,7 @@ void switchToOtaApp(int index) {
   }
   DBG_PRINTF("[OTA] Switching to \"%s\" (subtype %d)...\n", otaApps[index].name, subtype);
   esp_ota_set_boot_partition(target);
+  logRebootReason("OTA_SWITCH");
   esp_restart();
 }
 
@@ -195,6 +332,9 @@ void setup() {
   // held, ota_0 holds a valid app image, and we are not already running from
   // ota_0. When it acts, it reboots and never returns.
   // ---------------------------------------------------------------------------
+  // Record this boot's reset cause BEFORE the hatch can restart us and erase it.
+  bootHistoryAppend();
+
   {
     freeink::recovery::SdUpdateOptions recovery;
     recovery.path = "/update.bin";
@@ -203,6 +343,19 @@ void setup() {
                                       // same image in a loop
     freeink::recovery::checkBootCombo(recovery);
   }
+
+  // If the bootloader has rollback enabled, an image flashed into the other OTA
+  // slot boots as PENDING_VERIFY: any reset afterwards sends the device back to
+  // the previous slot — here, the Escape Hatch. That matches exactly what we see
+  // (device lands in the hatch with no recovery-combo mark in the history), so
+  // declare this image good as soon as we are running. Harmless no-op when
+  // rollback is not enabled.
+  esp_ota_mark_app_valid_cancel_rollback();
+
+  bootHistoryConfirm();
+  readCrumb();
+  readCoreDump();
+  readAndClearRebootReason();
 
   DBG_INIT();
   DBG_PRINTLN("MicroSlate starting...");
@@ -390,6 +543,7 @@ static void processPhysicalButtons() {
       if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
         saveCurrentFile();
       }
+      logRebootReason("BACK_5S");
       delay(100);
       ESP.restart();
     }
