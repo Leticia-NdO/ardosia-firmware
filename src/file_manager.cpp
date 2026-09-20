@@ -2,6 +2,7 @@
 #include "text_editor.h"
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <Utf8.h>
 #include <cstring>
 
 // --- File list ---
@@ -31,13 +32,50 @@ static void filenameToTitle(const char* filename, char* out, int maxLen) {
   if (j == 0) strncpy(out, "Untitled", maxLen - 1);
 }
 
-// Convert a title to a valid FAT filename (lowercase, spaces->underscores,
-// non-alphanumeric stripped, ".txt" appended).
+// Fold an accented Latin-1 letter onto its ASCII base (á -> a, ç -> c).
+// Returns 0 when there is no sensible ASCII equivalent.
+//
+// Needed because the note title round-trips through the filename: loadFile()
+// rebuilds the title with filenameToTitle(). Simply dropping the non-ASCII
+// bytes — which is what this did before UTF-8 input existed — turned "Diário"
+// into "dirio.txt" and then back into the title "Dirio".
+//
+// NOTE the ceiling of this fix: "Diário" comes back as "Diario". The accent is
+// preserved inside the note, but not in its title, because the title is not
+// stored anywhere except in the filename. Keeping it would mean changing the
+// note file format and the sync protocol.
+static char foldToAscii(uint32_t cp) {
+  if (cp < 0x80) return static_cast<char>(cp);
+  // Fold uppercase Latin-1 to lowercase first (À..Þ -> à..þ, skipping ×).
+  if (cp >= 0x00C0 && cp <= 0x00DE && cp != 0x00D7) cp += 0x20;
+  switch (cp) {
+    case 0x00E0: case 0x00E1: case 0x00E2:
+    case 0x00E3: case 0x00E4: case 0x00E5: return 'a';
+    case 0x00E7:                           return 'c';
+    case 0x00E8: case 0x00E9:
+    case 0x00EA: case 0x00EB:              return 'e';
+    case 0x00EC: case 0x00ED:
+    case 0x00EE: case 0x00EF:              return 'i';
+    case 0x00F1:                           return 'n';
+    case 0x00F2: case 0x00F3: case 0x00F4:
+    case 0x00F5: case 0x00F6:              return 'o';
+    case 0x00F9: case 0x00FA:
+    case 0x00FB: case 0x00FC:              return 'u';
+    case 0x00FD: case 0x00FF:              return 'y';
+    default:                               return 0;
+  }
+}
+
+// Convert a title to a valid FAT filename (lowercase, accents folded to ASCII,
+// spaces->underscores, anything else stripped, ".txt" appended).
 static void titleToFilename(const char* title, char* out, int maxLen) {
   int maxBase = maxLen - 5; // room for ".txt" + null
   int j = 0;
-  for (int i = 0; title[i] != '\0' && j < maxBase; i++) {
-    char c = title[i];
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(title);
+  uint32_t cp;
+  while ((cp = utf8NextCodepoint(&p)) != 0 && j < maxBase) {
+    char c = foldToAscii(cp);
+    if (c == 0) continue;
     if (c >= 'A' && c <= 'Z') c += 32;
     if ((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')) {
       out[j++] = c;

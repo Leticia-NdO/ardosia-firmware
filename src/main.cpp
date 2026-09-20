@@ -5,7 +5,6 @@
 #include <esp_pm.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
-#include <esp_core_dump.h>
 #include <Preferences.h>
 #include <RecoveryBoot.h>
 #include "sd_backup.h"
@@ -16,7 +15,27 @@
 #include "text_editor.h"
 #include "file_manager.h"
 #include "ui_renderer.h"
+#include "sleep_screen.h"
 #include "wifi_sync.h"
+
+// --- Power button timing -----------------------------------------------------
+// Hold-to-sleep was 3000ms here; crosspoint-reader uses 400ms
+// (CrossPointSettings::getPowerButtonDuration) and that is what the hardware
+// feels like it wants. Original value noted in case 400 turns out too twitchy.
+//
+// Shortening it is NOT just a smaller number. Two guards have to come with it,
+// both of which crosspoint carries:
+//
+//  1. powerReleasedSinceWake — you wake the device by PRESSING power, and on a
+//     deep-sleep wake the chip resets with the button still down. At 3000ms you
+//     would have let go long before; at 400ms the device would fall straight
+//     back asleep in your hand. Sleep is armed only after a release is seen.
+//  2. allowSleepAt — a grace window after boot, so the first refresh finishes
+//     before any hold can count.
+static constexpr unsigned long POWER_SLEEP_HOLD_MS = 400;   // was 3000
+static constexpr unsigned long POWER_SHORT_PRESS_MIN_MS = 50;
+static constexpr unsigned long POWER_WAKE_GRACE_MS = 2000;
+static unsigned long allowSleepAt = 0;
 
 // Enum for sleep reasons
 enum class SleepReason {
@@ -41,139 +60,24 @@ HalGPIO gpio;
 // --- Persistent settings (NVS) ---
 static Preferences uiPrefs;
 
-// --- Reboot provenance -------------------------------------------------------
-// esp_reset_reason() reports RST:SW for EVERY deliberate restart, so it cannot
-// tell "the 5s BACK handler fired" apart from "the Escape Hatch sent us here".
-// On a USB-locked device with no serial console that ambiguity is expensive, so
-// each restart site stamps its own tag in NVS on the way out, and the next boot
-// reads it back into lastRebootTag for the footer.
-char lastRebootTag[24] = "";
-
-void logRebootReason(const char* tag) {
+// --- One-shot cleanup of the old diagnostics ---------------------------------
+// The temporary crash instrumentation (boot history, connect breadcrumb, reboot
+// tag) kept its state in the "diag" NVS namespace, written on every boot. The
+// code is gone; this drops the keys it left behind so the flash is not carrying
+// dead state. Self-limiting: once the keys are removed isKey() is false and no
+// further write ever happens. Safe to delete after one boot of this firmware.
+static void dropLegacyDiagKeys() {
   Preferences p;
+  if (!p.begin("diag", true)) return;            // namespace never existed
+  const bool stale = p.isKey("hist") || p.isKey("crumb") || p.isKey("why");
+  p.end();
+  if (!stale) return;
   if (p.begin("diag", false)) {
-    p.putString("why", tag);
+    p.remove("hist");
+    p.remove("crumb");
+    p.remove("why");
     p.end();
   }
-}
-
-// --- Boot history -----------------------------------------------------------
-// Reading the footer requires walking back through the Escape Hatch, whose "Boot
-// Other Slot" calls esp_restart() — so by the time the screen is visible,
-// esp_reset_reason() only ever reports SW and the original cause is gone. Fix:
-// record each boot's reason in NVS BEFORE anything can restart us, and keep a
-// short history.
-//
-// Each entry is <reason><mark>, where the mark is:
-//   ?  this boot never got past the recovery hatch — checkBootCombo() diverted
-//      it to the Escape Hatch, which means the Back+Up combo read as held
-//   !  this boot survived the hatch and reached the app
-//
-// So "BRN? SW!" reads as: a brownout reboot that the combo then intercepted,
-// followed by a deliberate restart that came up normally.
-//
-// This writes to NVS twice per boot. It is a debugging aid — drop it once the
-// BLE connect crash is understood, rather than leaving it wearing the flash.
-char bootHistory[64] = "";
-
-static const char* reasonAbbrev() {
-  switch (esp_reset_reason()) {
-    case ESP_RST_POWERON:   return "PWR";
-    case ESP_RST_EXT:       return "EXT";
-    case ESP_RST_SW:        return "SW";
-    case ESP_RST_PANIC:     return "PAN";
-    case ESP_RST_INT_WDT:   return "IWD";
-    case ESP_RST_TASK_WDT:  return "TWD";
-    case ESP_RST_WDT:       return "WDT";
-    case ESP_RST_DEEPSLEEP: return "DSL";
-    case ESP_RST_BROWNOUT:  return "BRN";
-    default:                return "UNK";
-  }
-}
-
-// Called BEFORE checkBootCombo(). Appends "<reason>?" to the history.
-static void bootHistoryAppend() {
-  Preferences p;
-  if (!p.begin("diag", false)) return;
-  String h = p.getString("hist", "");
-  h += reasonAbbrev();
-  h += "? ";
-  while (h.length() > 40) {           // keep only the recent tail
-    int sp = h.indexOf(' ');
-    if (sp < 0) break;
-    h = h.substring(sp + 1);
-  }
-  p.putString("hist", h);
-  snprintf(bootHistory, sizeof(bootHistory), "%s", h.c_str());
-  p.end();
-}
-
-// Called AFTER checkBootCombo() returned — i.e. the hatch did NOT divert us.
-// Flips this boot's trailing '?' to '!'.
-static void bootHistoryConfirm() {
-  Preferences p;
-  if (!p.begin("diag", false)) return;
-  String h = p.getString("hist", "");
-  int q = h.lastIndexOf('?');
-  if (q >= 0) {
-    h.setCharAt(q, '!');
-    p.putString("hist", h);
-    snprintf(bootHistory, sizeof(bootHistory), "%s", h.c_str());
-  }
-  p.end();
-}
-
-// Breadcrumb in NVS. The RTC-memory version read back as 0 even when the code
-// had clearly run, so trust the storage that demonstrably works instead.
-char lastCrumb[16] = "";
-
-void logCrumb(const char* tag) {
-  Preferences p;
-  if (p.begin("diag", false)) {
-    p.putString("crumb", tag);
-    p.end();
-  }
-}
-
-// Pull the faulting task and program counter out of the core dump the panic
-// handler wrote to flash. This is the closest thing to a backtrace available
-// without a serial console: feed the PC to
-//   xtensa-esp32-elf-addr2line -pfiaC -e .pio/build/xteink_x4/firmware.elf <pc>
-// (riscv32-esp-elf-addr2line on the C3) to get file:line.
-// The image is erased after reading so a stale crash cannot masquerade as a new
-// one.
-char crashInfo[40] = "";
-
-static void readCoreDump() {
-  if (esp_core_dump_image_check() != ESP_OK) return;
-  esp_core_dump_summary_t* sum =
-      (esp_core_dump_summary_t*)malloc(sizeof(esp_core_dump_summary_t));
-  if (!sum) return;
-  if (esp_core_dump_get_summary(sum) == ESP_OK) {
-    snprintf(crashInfo, sizeof(crashInfo), "%s@%08lx",
-             sum->exc_task, (unsigned long)sum->exc_pc);
-  }
-  free(sum);
-  esp_core_dump_image_erase();
-}
-
-static void readCrumb() {
-  Preferences p;
-  if (!p.begin("diag", false)) return;
-  String c = p.getString("crumb", "");
-  snprintf(lastCrumb, sizeof(lastCrumb), "%s", c.c_str());
-  p.end();
-}
-
-static void readAndClearRebootReason() {
-  Preferences p;
-  if (!p.begin("diag", false)) return;
-  String why = p.getString("why", "");
-  if (why.length() > 0) {
-    snprintf(lastRebootTag, sizeof(lastRebootTag), "%s", why.c_str());
-    p.remove("why");   // one-shot: don't let a stale tag explain a later boot
-  }
-  p.end();
 }
 
 // --- Shared UI state ---
@@ -198,6 +102,11 @@ bool deleteConfirmPending = false;
 WritingMode writingMode = WritingMode::NORMAL;
 FontSize fontSize = FontSize::LARGE;
 bool showWordCount = true;
+// Defaults to ABNT2: this fork is written in Portuguese and pairs with a
+// Brazilian keyboard. Switchable in Settings (US / US-Intl / ABNT2).
+KeyboardLayout keyboardLayout = KeyboardLayout::ABNT2;
+SleepScreenMode sleepScreenMode = SleepScreenMode::TEXT;
+SleepBrightness sleepBrightness = SleepBrightness::NORMAL;
 
 // --- OTA App Detection ---
 OtaAppEntry otaApps[MAX_OTA_APPS];
@@ -270,7 +179,6 @@ void switchToOtaApp(int index) {
   }
   DBG_PRINTF("[OTA] Switching to \"%s\" (subtype %d)...\n", otaApps[index].name, subtype);
   esp_ota_set_boot_partition(target);
-  logRebootReason("OTA_SWITCH");
   esp_restart();
 }
 
@@ -332,9 +240,6 @@ void setup() {
   // held, ota_0 holds a valid app image, and we are not already running from
   // ota_0. When it acts, it reboots and never returns.
   // ---------------------------------------------------------------------------
-  // Record this boot's reset cause BEFORE the hatch can restart us and erase it.
-  bootHistoryAppend();
-
   {
     freeink::recovery::SdUpdateOptions recovery;
     recovery.path = "/update.bin";
@@ -346,16 +251,12 @@ void setup() {
 
   // If the bootloader has rollback enabled, an image flashed into the other OTA
   // slot boots as PENDING_VERIFY: any reset afterwards sends the device back to
-  // the previous slot — here, the Escape Hatch. That matches exactly what we see
-  // (device lands in the hatch with no recovery-combo mark in the history), so
-  // declare this image good as soon as we are running. Harmless no-op when
-  // rollback is not enabled.
+  // the previous slot — here, the Escape Hatch. That is exactly what this device
+  // did before this call existed, so declare the image good as soon as we are
+  // running. Harmless no-op when rollback is not enabled.
   esp_ota_mark_app_valid_cancel_rollback();
 
-  bootHistoryConfirm();
-  readCrumb();
-  readCoreDump();
-  readAndClearRebootReason();
+  dropLegacyDiagKeys();
 
   DBG_INIT();
   DBG_PRINTLN("MicroSlate starting...");
@@ -375,6 +276,13 @@ void setup() {
   writingMode = static_cast<WritingMode>(uiPrefs.getUChar("writeMode", 0));
   fontSize = static_cast<FontSize>(uiPrefs.getUChar("fontSize", 2));
   showWordCount = uiPrefs.getBool("showWC", true);
+  keyboardLayout = static_cast<KeyboardLayout>(
+      uiPrefs.getUChar("kbLayout", static_cast<uint8_t>(KeyboardLayout::ABNT2)));
+  if (static_cast<int>(keyboardLayout) > 2) keyboardLayout = KeyboardLayout::ABNT2;
+  sleepScreenMode = static_cast<SleepScreenMode>(uiPrefs.getUChar("sleepScr", 0));
+  if (static_cast<int>(sleepScreenMode) > 2) sleepScreenMode = SleepScreenMode::TEXT;
+  sleepBrightness = static_cast<SleepBrightness>(uiPrefs.getUChar("sleepLight", 0));
+  if (static_cast<int>(sleepBrightness) > 2) sleepBrightness = SleepBrightness::NORMAL;
 
   // Apply saved orientation
   {
@@ -401,11 +309,17 @@ void setup() {
       int wm = jsonGetInt(uiBuf, "writeMode");
       int fs = jsonGetInt(uiBuf, "fontSize");
       int wc = jsonGetInt(uiBuf, "showWC");
+      int kb = jsonGetInt(uiBuf, "kbLayout");
+      int ss = jsonGetInt(uiBuf, "sleepScr");
+      int sl = jsonGetInt(uiBuf, "sleepLight");
       if (o  >= 0) { uiPrefs.putUChar("orient",    (uint8_t)o);  currentOrientation = static_cast<Orientation>(o); }
       if (d  >= 0) { uiPrefs.putBool("darkMode",   d != 0);      darkMode           = (d != 0); }
       if (wm >= 0) { uiPrefs.putUChar("writeMode", (uint8_t)wm); writingMode        = static_cast<WritingMode>(wm); }
       if (fs >= 0) { uiPrefs.putUChar("fontSize",  (uint8_t)fs); fontSize           = static_cast<FontSize>(fs); }
       if (wc >= 0) { uiPrefs.putBool("showWC",     wc != 0);     showWordCount      = (wc != 0); }
+      if (kb >= 0) { uiPrefs.putUChar("kbLayout",  (uint8_t)kb); keyboardLayout     = static_cast<KeyboardLayout>(kb); }
+      if (ss >= 0) { uiPrefs.putUChar("sleepScr",  (uint8_t)ss); sleepScreenMode    = static_cast<SleepScreenMode>(ss); }
+      if (sl >= 0) { uiPrefs.putUChar("sleepLight",(uint8_t)sl); sleepBrightness    = static_cast<SleepBrightness>(sl); }
       // Re-apply orientation in case it changed
       GfxRenderer::Orientation gfxOrient = GfxRenderer::Portrait;
       switch (currentOrientation) {
@@ -447,6 +361,9 @@ void setup() {
   renderer.clearScreen();
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
 
+  // Don't let a hold that started before boot finished count as a sleep gesture.
+  allowSleepAt = millis() + POWER_WAKE_GRACE_MS;
+
   screenDirty = true;
 }
 
@@ -454,13 +371,14 @@ void setup() {
 void enterDeepSleep(SleepReason reason) {
   DBG_PRINTLN("Entering deep sleep...");
   
-  // Render the sleep screen before entering deep sleep
-  renderSleepScreen();
-
-  // Save any unsaved work
+  // Save any unsaved work FIRST. Rendering now touches the SD card to load a
+  // wallpaper, so it is no longer the trivially safe step it used to be, and
+  // unsaved text must not depend on it returning.
   if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
     saveCurrentFile();
   }
+
+  renderSleepScreen();
 
   display.deepSleep();     // Power down display first
   gpio.startDeepSleep();   // Waits for power button release, then sleeps
@@ -490,8 +408,11 @@ static void processPhysicalButtons() {
   static bool powerHeld = false;
   static unsigned long powerPressStart = 0;
   static bool sleepTriggered = false;
+  // The wake press must not become a sleep gesture: see POWER_SLEEP_HOLD_MS.
+  static bool powerReleasedSinceWake = false;
 
   bool btnPower = gpio.isPressed(HalGPIO::BTN_POWER);
+  if (!btnPower) powerReleasedSinceWake = true;
 
   if (btnPower && !powerHeld) {
     // Button just pressed
@@ -500,8 +421,9 @@ static void processPhysicalButtons() {
     powerPressStart = millis();
   }
 
-  if (btnPower && powerHeld && !sleepTriggered) {
-    if (millis() - powerPressStart > 3000) {
+  if (btnPower && powerHeld && !sleepTriggered
+      && powerReleasedSinceWake && millis() >= allowSleepAt) {
+    if (millis() - powerPressStart > POWER_SLEEP_HOLD_MS) {
       sleepTriggered = true;
       enterDeepSleep(SleepReason::POWER_LONGPRESS);
       return; // Exit early to prevent further processing
@@ -513,7 +435,11 @@ static void processPhysicalButtons() {
     unsigned long duration = millis() - powerPressStart;
     powerHeld = false;
 
-    if (!sleepTriggered && duration > 50 && duration < 1000) {
+    // The short-press window ends where the sleep hold begins — with the old
+    // 1000ms ceiling against a 400ms hold, a half-second press would have been
+    // both "go to the main menu" and "sleep".
+    if (!sleepTriggered && duration > POWER_SHORT_PRESS_MIN_MS
+        && duration < POWER_SLEEP_HOLD_MS) {
       // Short press - go to main menu (except when already there)
       if (currentState != UIState::MAIN_MENU) {
         if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
@@ -543,7 +469,6 @@ static void processPhysicalButtons() {
       if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
         saveCurrentFile();
       }
-      logRebootReason("BACK_5S");
       delay(100);
       ESP.restart();
     }
@@ -753,33 +678,44 @@ void registerActivity() {
 }
 
 // Function to render the sleep screen
+//
+// A wallpaper is attempted first; the built-in card is the fallback whenever
+// there is no card, no /sleep folder, or nothing in it that parses as a BMP.
+// On a device with no USB recovery, "asleep showing nothing" is a state worth
+// never creating.
 void renderSleepScreen() {
+  if (sleepScreenDrawImage(renderer, sleepScreenMode, sleepBrightness)) {
+    renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+    delay(500);
+    return;
+  }
+
   renderer.clearScreen();
-  
+
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
-  
+
   // Title: "MicroSlate"
   const char* title = "MicroSlate";
   int titleWidth = renderer.getTextAdvanceX(FONT_BODY, title);
   int titleX = (sw - titleWidth) / 2;
   int titleY = sh * 0.35; // 35% down the screen (moved up)
   renderer.drawText(FONT_BODY, titleX, titleY, title, true, EpdFontFamily::BOLD);
-  
+
   // Subtitle: "Asleep"
   const char* subtitle = "Asleep";
   int subTitleWidth = renderer.getTextAdvanceX(FONT_UI, subtitle);
   int subTitleX = (sw - subTitleWidth) / 2;
   int subTitleY = sh * 0.48; // 48% down the screen (moved up)
   renderer.drawText(FONT_UI, subTitleX, subTitleY, subtitle, true);
-  
+
   // Footer: "Hold Power to wake"
   const char* footer = "Hold Power to wake";
   int footerWidth = renderer.getTextAdvanceX(FONT_SMALL, footer);
   int footerX = (sw - footerWidth) / 2;
   int footerY = sh * 0.75; // 75% down the screen (moved up from bottom)
   renderer.drawText(FONT_SMALL, footerX, footerY, footer);
-  
+
   // Perform a full display refresh to ensure the sleep screen is visible
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
   
@@ -868,25 +804,39 @@ void loop() {
   static WritingMode lastSavedWritingMode = writingMode;
   static FontSize lastSavedFontSize = fontSize;
   static bool lastSavedShowWordCount = showWordCount;
+  static KeyboardLayout lastSavedKeyboardLayout = keyboardLayout;
+  static SleepScreenMode lastSavedSleepScreen = sleepScreenMode;
+  static SleepBrightness lastSavedSleepBrightness = sleepBrightness;
   if (currentOrientation != lastSavedOrientation || darkMode != lastSavedDarkMode
       || writingMode != lastSavedWritingMode || fontSize != lastSavedFontSize
-      || showWordCount != lastSavedShowWordCount) {
+      || showWordCount != lastSavedShowWordCount
+      || keyboardLayout != lastSavedKeyboardLayout
+      || sleepScreenMode != lastSavedSleepScreen
+      || sleepBrightness != lastSavedSleepBrightness) {
     uiPrefs.putUChar("orient", static_cast<uint8_t>(currentOrientation));
     uiPrefs.putBool("darkMode", darkMode);
     uiPrefs.putUChar("writeMode", static_cast<uint8_t>(writingMode));
     uiPrefs.putUChar("fontSize", static_cast<uint8_t>(fontSize));
     uiPrefs.putBool("showWC", showWordCount);
+    uiPrefs.putUChar("kbLayout", static_cast<uint8_t>(keyboardLayout));
+    uiPrefs.putUChar("sleepScr", static_cast<uint8_t>(sleepScreenMode));
+    uiPrefs.putUChar("sleepLight", static_cast<uint8_t>(sleepBrightness));
     lastSavedOrientation = currentOrientation;
     lastSavedDarkMode = darkMode;
     lastSavedWritingMode = writingMode;
     lastSavedFontSize = fontSize;
     lastSavedShowWordCount = showWordCount;
+    lastSavedKeyboardLayout = keyboardLayout;
+    lastSavedSleepScreen = sleepScreenMode;
+    lastSavedSleepBrightness = sleepBrightness;
     // Keep SD backup in sync so settings survive a firmware flash
-    static char uiBuf[128];
+    static char uiBuf[200];
     snprintf(uiBuf, sizeof(uiBuf),
-             "{\"orient\":%d,\"dark\":%d,\"writeMode\":%d,\"fontSize\":%d,\"showWC\":%d}",
+             "{\"orient\":%d,\"dark\":%d,\"writeMode\":%d,\"fontSize\":%d,"
+             "\"showWC\":%d,\"kbLayout\":%d,\"sleepScr\":%d,\"sleepLight\":%d}",
              (int)currentOrientation, darkMode ? 1 : 0,
-             (int)writingMode, (int)fontSize, showWordCount ? 1 : 0);
+             (int)writingMode, (int)fontSize, showWordCount ? 1 : 0,
+             (int)keyboardLayout, (int)sleepScreenMode, (int)sleepBrightness);
     if (!SdMan.exists("/microslate")) SdMan.mkdir("/microslate");
     sdWriteFile("/microslate/ui_prefs.json", uiBuf);
   }

@@ -1,4 +1,5 @@
 #include "text_editor.h"
+#include "utf8_util.h"
 #include <cstring>
 #include <algorithm>
 
@@ -37,7 +38,14 @@ void editorRecalculateLines() {
     int col = 0;
     int lastSpace = -1;
 
-    for (int i = 0; i < (int)textLength && lineCount < MAX_LINES; i++) {
+    // Walks the buffer one CHARACTER at a time, not one byte: "á" is two bytes
+    // and must count as a single column, and a line may only ever break on a
+    // character boundary — a linePositions[] entry landing mid-sequence would
+    // hand the renderer half a character.
+    int i = 0;
+    while (i < (int)textLength && lineCount < MAX_LINES) {
+      const int next = (int)utf8NextStart(textBuffer, textLength, (size_t)i);
+
       if (textBuffer[i] == '\n') {
         // Hard line break
         if (lineCount < MAX_LINES) {
@@ -46,6 +54,7 @@ void editorRecalculateLines() {
         }
         col = 0;
         lastSpace = -1;
+        i = next;
         continue;
       }
 
@@ -60,16 +69,17 @@ void editorRecalculateLines() {
         if (lastSpace > linePositions[lineCount - 1]) {
           breakPos = lastSpace + 1; // Break after space
         } else {
-          breakPos = i + 1;  // Hard break mid-word
+          breakPos = next;  // Hard break mid-word, on a character boundary
         }
 
         if (lineCount < MAX_LINES) {
           linePositions[lineCount] = breakPos;
           lineCount++;
         }
-        col = i + 1 - breakPos;
+        col = utf8CountRange(textBuffer, (size_t)breakPos, (size_t)next);
         lastSpace = -1;
       }
+      i = next;
     }
     lineBreaksDirty = false;
   }
@@ -151,16 +161,21 @@ int editorGetWordCount() {
   return count;
 }
 
-void editorInsertChar(char c) {
-  if (textLength >= TEXT_BUFFER_SIZE - 1) return;
+// Insert one character. Takes a Unicode codepoint rather than a char because a
+// single byte cannot express "á" (0xC3 0xA1) — the buffer stays UTF-8 bytes,
+// but a character is inserted and removed as one unit.
+void editorInsertCodepoint(uint32_t cp) {
+  char enc[4];
+  const int n = utf8Encode(cp, enc);
+  if (n <= 0) return;
+  if (textLength + (size_t)n >= TEXT_BUFFER_SIZE - 1) return;
 
-  // Shift text right
-  for (int i = (int)textLength; i > cursorPosition; i--) {
-    textBuffer[i] = textBuffer[i - 1];
-  }
-  textBuffer[cursorPosition] = c;
-  cursorPosition++;
-  textLength++;
+  // Shift the tail right by the encoded length, then drop the bytes in.
+  memmove(textBuffer + cursorPosition + n, textBuffer + cursorPosition,
+          textLength - (size_t)cursorPosition);
+  memcpy(textBuffer + cursorPosition, enc, (size_t)n);
+  cursorPosition += n;
+  textLength += (size_t)n;
   textBuffer[textLength] = '\0';
   unsavedChanges = true;
   lineBreaksDirty = true;
@@ -172,11 +187,15 @@ void editorInsertChar(char c) {
 void editorDeleteChar() {
   if (cursorPosition <= 0 || textLength == 0) return;
 
-  for (int i = cursorPosition - 1; i < (int)textLength - 1; i++) {
-    textBuffer[i] = textBuffer[i + 1];
-  }
-  cursorPosition--;
-  textLength--;
+  // Remove the whole character, not one byte: deleting half of "á" would leave
+  // a stray 0xC3 that the renderer draws as a replacement glyph and that
+  // corrupts the saved file.
+  const int start = (int)utf8PrevStart(textBuffer, (size_t)cursorPosition);
+  const size_t n = (size_t)(cursorPosition - start);
+  memmove(textBuffer + start, textBuffer + cursorPosition,
+          textLength - (size_t)cursorPosition);
+  cursorPosition = start;
+  textLength -= n;
   textBuffer[textLength] = '\0';
   unsavedChanges = true;
   lineBreaksDirty = true;
@@ -188,10 +207,10 @@ void editorDeleteChar() {
 void editorDeleteForward() {
   if (cursorPosition >= (int)textLength) return;
 
-  for (int i = cursorPosition; i < (int)textLength - 1; i++) {
-    textBuffer[i] = textBuffer[i + 1];
-  }
-  textLength--;
+  const size_t end = utf8NextStart(textBuffer, textLength, (size_t)cursorPosition);
+  const size_t n = end - (size_t)cursorPosition;
+  memmove(textBuffer + cursorPosition, textBuffer + end, textLength - end);
+  textLength -= n;
   textBuffer[textLength] = '\0';
   unsavedChanges = true;
   lineBreaksDirty = true;
@@ -202,7 +221,7 @@ void editorDeleteForward() {
 
 void editorMoveCursorLeft() {
   if (cursorPosition > 0) {
-    cursorPosition--;
+    cursorPosition = (int)utf8PrevStart(textBuffer, (size_t)cursorPosition);
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
@@ -210,7 +229,7 @@ void editorMoveCursorLeft() {
 
 void editorMoveCursorRight() {
   if (cursorPosition < (int)textLength) {
-    cursorPosition++;
+    cursorPosition = (int)utf8NextStart(textBuffer, textLength, (size_t)cursorPosition);
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
@@ -220,14 +239,19 @@ void editorMoveCursorUp() {
   // cursorLine/cursorCol are already valid from the previous operation
   if (cursorLine <= 0) return;
 
+  // cursorCol is a byte offset; the column the user sees is a character count,
+  // so translate through characters or an accented line shifts the cursor.
+  const int col = utf8CountRange(textBuffer, (size_t)linePositions[cursorLine],
+                                 (size_t)cursorPosition);
+
   int targetLine = cursorLine - 1;
   int lineStart = linePositions[targetLine];
   int lineEnd = (targetLine + 1 < lineCount) ? linePositions[targetLine + 1] : (int)textLength;
-  int lineLen = lineEnd - lineStart;
-  // Don't count trailing newline
-  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
+  // Don't land on the trailing newline
+  if (lineEnd > lineStart && textBuffer[lineEnd - 1] == '\n') lineEnd--;
 
-  cursorPosition = lineStart + std::min(cursorCol, lineLen);
+  cursorPosition = (int)utf8AdvanceCodepoints(textBuffer, (size_t)lineStart,
+                                              (size_t)lineEnd, col);
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
@@ -235,13 +259,16 @@ void editorMoveCursorUp() {
 void editorMoveCursorDown() {
   if (cursorLine >= lineCount - 1) return;
 
+  const int col = utf8CountRange(textBuffer, (size_t)linePositions[cursorLine],
+                                 (size_t)cursorPosition);
+
   int targetLine = cursorLine + 1;
   int lineStart = linePositions[targetLine];
   int lineEnd = (targetLine + 1 < lineCount) ? linePositions[targetLine + 1] : (int)textLength;
-  int lineLen = lineEnd - lineStart;
-  if (lineLen > 0 && textBuffer[lineStart + lineLen - 1] == '\n') lineLen--;
+  if (lineEnd > lineStart && textBuffer[lineEnd - 1] == '\n') lineEnd--;
 
-  cursorPosition = lineStart + std::min(cursorCol, lineLen);
+  cursorPosition = (int)utf8AdvanceCodepoints(textBuffer, (size_t)lineStart,
+                                              (size_t)lineEnd, col);
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
@@ -305,6 +332,7 @@ void editorSetCurrentFile(const char* filename) {
 void editorSetCurrentTitle(const char* title) {
   strncpy(currentTitle, title, MAX_TITLE_LEN - 1);
   currentTitle[MAX_TITLE_LEN - 1] = '\0';
+  utf8TrimPartialTail(currentTitle);   // a cut at the limit must not split an "á"
 }
 
 const char* editorGetCurrentFile() { return currentFile; }

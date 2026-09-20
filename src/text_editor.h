@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config.h"
+#include <cstdint>
 
 void editorInit();
 void editorClear();
@@ -12,7 +13,9 @@ size_t editorGetLength();
 int editorGetCursorPosition();
 
 // Editing operations
-void editorInsertChar(char c);
+// Takes a Unicode codepoint: a single char cannot carry "á" (two UTF-8 bytes).
+// The buffer itself stays UTF-8 bytes; insert/delete move whole characters.
+void editorInsertCodepoint(uint32_t cp);
 void editorDeleteChar();     // Backspace
 void editorDeleteForward();  // Delete key
 

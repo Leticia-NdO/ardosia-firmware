@@ -62,21 +62,6 @@ static uint32_t currentPasskey = 0;
 // Forward declarations
 static bool setupHidConnection();
 
-// --- Connect-path breadcrumb -------------------------------------------------
-// Something calls esp_restart() partway through the BLE connect and it is not
-// application code, so we need to know how far the task gets before dying.
-// RTC slow memory survives a software reset (it only clears on a cold power-on),
-// costs nothing to write, and unlike NVS does not wear the flash.
-//
-// Read back as "BLE:<n>" in the main-menu footer:
-//   1 task entered        4 security attempted
-//   2 about to connect()  5 about to set up HID
-//   3 link established    6 HID ready — keyboard usable
-// A footer showing BLE:3 means the device died between link-up and security.
-
-void logCrumb(const char* tag);   // main.cpp — persists to NVS
-
-static inline void crumb(const char* tag) { logCrumb(tag); }
 int getLastUsedKeyboardIndex();
 
 // Helper: upsert device into discovered list
@@ -374,7 +359,6 @@ static bool setupHidConnection() {
 // --- FreeRTOS task: runs connect + security + HID setup off the main loop ---
 
 static void bleConnectTask(void* param) {
-  crumb("T1");
   bleState = BLEState::CONNECTING;
   authSuccess = false;
 
@@ -419,7 +403,6 @@ static void bleConnectTask(void* param) {
   // If the panic disappears, this was it, and the right long-term fix is to call
   // deleteBond only when a bond actually exists, well away from connect().
   // If the panic persists, put this line straight back.
-  crumb("T2");
   if (!pClient->connect(addr, true)) {
     DBG_PRINTLN("[BLE-Task] Connection failed");
     bleState = BLEState::DISCONNECTED;
@@ -428,12 +411,10 @@ static void bleConnectTask(void* param) {
     return;
   }
 
-  crumb("T3");
   DBG_PRINTLN("[BLE-Task] Connected, attempting security...");
 
   // Step 2: Try security pairing (optional for some keyboards)
   // If this fails, we'll still try HID setup in case the keyboard doesn't require auth
-  crumb("T4");
   bool secureAttempted = pClient->secureConnection();
 
   if (secureAttempted) {
@@ -452,7 +433,6 @@ static void bleConnectTask(void* param) {
     DBG_PRINTLN("[BLE-Task] secureConnection() returned false - trying HID anyway");
   }
 
-  crumb("T5");
   DBG_PRINTLN("[BLE-Task] Setting up HID...");
 
   // Step 4: Service discovery + HID subscription (blocks this task)
@@ -472,7 +452,6 @@ static void bleConnectTask(void* param) {
   reconnectDelay = 5000;  // Reset backoff after successful connection
   bleConnIdleMode = false;
   lastBleKeystrokeMs = millis();  // Start the 3s idle timer from now, not from boot
-  crumb("OK");
   DBG_PRINTLN("[BLE-Task] Keyboard ready!");
 
   // NOTE: updateConnParams() is intentionally NOT called here.  Calling it immediately
@@ -730,7 +709,6 @@ void bleLoop() {
   // Launch connect task if requested (non-blocking)
   if (connectToKeyboard && bleState != BLEState::CONNECTED && connectTaskHandle == nullptr) {
     connectToKeyboard = false;
-    crumb("ST");
     startConnectTask();
     return;
   }
@@ -813,20 +791,16 @@ BleDeviceInfo* getDiscoveredDevices() {
 }
 
 void connectToDevice(int deviceIndex) {
-  crumb("UI1");
   if (deviceIndex < 0 || deviceIndex >= (int)discoveredDevices.size()) {
     DBG_PRINTLN("[BLE] Invalid device index");
     return;
   }
 
-  crumb("UI2");
   stopDeviceScan();
-  crumb("UI3");
 
   if (pClient && pClient->isConnected()) {
     pClient->disconnect();
   }
-  crumb("UI4");
 
   keyboardAddress = discoveredDevices[deviceIndex].address;
   keyboardAddressType = discoveredDevices[deviceIndex].addressType;

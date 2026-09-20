@@ -3,9 +3,13 @@
 #include "file_manager.h"
 #include "ble_keyboard.h"
 #include "wifi_sync.h"
+#include "utf8_util.h"
+#include "deadkeys.h"
+#include "keymap.h"
 
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <cstring>
 
 // External variables
 extern bool autoReconnectEnabled;
@@ -33,6 +37,28 @@ static volatile bool queueFull = false;
 
 // --- CapsLock state ---
 static bool capsLockOn = false;
+
+// --- Keyboard layout (defined in main.cpp, persisted in NVS) ---
+extern KeyboardLayout keyboardLayout;
+extern SleepScreenMode sleepScreenMode;
+extern SleepBrightness sleepBrightness;
+
+// --- Last key seen, shown in the Settings footer -----------------------------
+// A BLE keyboard reports HID usage codes by physical POSITION, not by what is
+// printed on the keycap: usage 0x35 is "the key left of 1" whatever its legend
+// says. So a keyboard that is not US ANSI lands different characters on the
+// same codes, and the only way to tell that apart from a mapping bug — on a
+// device with no serial console — is to show the raw code that arrived.
+//
+// Permanent, not diagnostic scaffolding: this device pairs with arbitrary
+// keyboards and has no other way to identify one.
+static uint8_t lastKeyHid = 0;
+static uint8_t lastKeyMods = 0;
+
+void inputGetLastKey(uint8_t* hid, uint8_t* mods) {
+  if (hid) *hid = lastKeyHid;
+  if (mods) *mods = lastKeyMods;
+}
 
 // Where to return after title edit is confirmed or cancelled
 static UIState renameReturnState = UIState::FILE_BROWSER;
@@ -93,45 +119,45 @@ static KeyEvent dequeueKeyEvent() {
   return event;
 }
 
-char hidToAscii(uint8_t hid, uint8_t modifiers) {
-  bool shifted = isShift(modifiers) ^ capsLockOn;
-
-  // Letters a-z (HID 0x04-0x1D)
-  if (hid >= 0x04 && hid <= 0x1D) {
-    char base = 'a' + (hid - 0x04);
-    return shifted ? (base - 32) : base;
-  }
-
-  // Number row (HID 0x1E-0x27)
-  static const char unshifted[] = "1234567890";
-  static const char shiftedNum[] = "!@#$%^&*()";
-  if (hid >= 0x1E && hid <= 0x27) {
-    int idx = hid - 0x1E;
-    return isShift(modifiers) ? shiftedNum[idx] : unshifted[idx];
-  }
-
-  // Special keys
-  switch (hid) {
-    case 0x28: return '\n';  // Enter
-    case 0x2B: return '\t';  // Tab
-    case 0x2C: return ' ';   // Space
-
-    // Symbol keys
-    case 0x2D: return isShift(modifiers) ? '_' : '-';
-    case 0x2E: return isShift(modifiers) ? '+' : '=';
-    case 0x2F: return isShift(modifiers) ? '{' : '[';
-    case 0x30: return isShift(modifiers) ? '}' : ']';
-    case 0x31: return isShift(modifiers) ? '|' : '\\';
-    case 0x33: return isShift(modifiers) ? ':' : ';';
-    case 0x34: return isShift(modifiers) ? '"' : '\'';
-    case 0x35: return isShift(modifiers) ? '~' : '`';
-    case 0x36: return isShift(modifiers) ? '<' : ',';
-    case 0x37: return isShift(modifiers) ? '>' : '.';
-    case 0x38: return isShift(modifiers) ? '?' : '/';
-
-    default: return 0;
-  }
+char hidToAscii(const uint8_t hid, const uint8_t modifiers) {
+  const KeyStroke k = keymapResolve(keyboardLayout, hid, modifiers, capsLockOn);
+  // ASCII only, and dead keys report their own character: callers that use this
+  // (the WiFi password field) want raw text, not composition.
+  return (k.cp != 0 && k.cp < 0x80) ? static_cast<char>(k.cp) : 0;
 }
+
+uint32_t inputGetPendingDeadKey() {
+  return deadKeyPending();
+}
+
+void inputClearDeadKey() {
+  deadKeyReset();
+}
+
+int inputResolveText(const uint8_t hid, const uint8_t modifiers, uint32_t out[2]) {
+  return deadKeyFeed(keymapResolve(keyboardLayout, hid, modifiers, capsLockOn), out);
+}
+
+// Human-readable description of the last key, for the Settings footer.
+void inputDescribeLastKey(char* buf, const size_t n) {
+  if (lastKeyHid == 0) {
+    snprintf(buf, n, "Key: press any key to identify it");
+    return;
+  }
+  const KeyStroke k = keymapResolve(keyboardLayout, lastKeyHid, lastKeyMods, capsLockOn);
+
+  char shown[12];
+  if (k.cp == 0)                      snprintf(shown, sizeof(shown), "-");
+  else if (k.cp == '\n')              snprintf(shown, sizeof(shown), "Enter");
+  else if (k.cp == '\t')              snprintf(shown, sizeof(shown), "Tab");
+  else if (k.cp == ' ')               snprintf(shown, sizeof(shown), "Space");
+  else if (k.cp < 0x80)               snprintf(shown, sizeof(shown), "%c", (char)k.cp);
+  else                                snprintf(shown, sizeof(shown), "U+%04lX", (unsigned long)k.cp);
+
+  snprintf(buf, n, "Key: 0x%02X mod:0x%02X -> %s%s",
+           lastKeyHid, lastKeyMods, shown, k.mark != DeadMark::None ? " (dead)" : "");
+}
+
 
 // Handle text editor input
 static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
@@ -191,6 +217,7 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
 
   // ESC = save and return to file browser
   if (keyCode == HID_KEY_ESCAPE) {
+    inputClearDeadKey();
     if (editorHasUnsavedChanges()) saveCurrentFile();
     currentState = UIState::FILE_BROWSER;
     screenDirty = true;
@@ -205,16 +232,26 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
     return;
   }
 
-  // Navigation keys
+  // Navigation keys.  An armed dead key is invisible state apart from the mark
+  // drawn in the cursor, so moving away from the insertion point cancels it
+  // instead of letting the accent land on whatever is typed next.
+  //
+  // Backspace cancels it too, and only that: with an accent pending, backspace
+  // is how you undo the accent, not how you delete the letter before it.
+  if (keyCode == HID_KEY_BACKSPACE && inputGetPendingDeadKey() != 0) {
+    inputClearDeadKey();
+    screenDirty = true;
+    return;
+  }
   switch (keyCode) {
-    case HID_KEY_LEFT:      editorMoveCursorLeft();  screenDirty = true; return;
-    case HID_KEY_RIGHT:     editorMoveCursorRight(); screenDirty = true; return;
-    case HID_KEY_UP:        editorMoveCursorUp();    screenDirty = true; return;
-    case HID_KEY_DOWN:      editorMoveCursorDown();  screenDirty = true; return;
-    case HID_KEY_HOME:      editorMoveCursorHome();  screenDirty = true; return;
-    case HID_KEY_END:       editorMoveCursorEnd();   screenDirty = true; return;
+    case HID_KEY_LEFT:      inputClearDeadKey(); editorMoveCursorLeft();  screenDirty = true; return;
+    case HID_KEY_RIGHT:     inputClearDeadKey(); editorMoveCursorRight(); screenDirty = true; return;
+    case HID_KEY_UP:        inputClearDeadKey(); editorMoveCursorUp();    screenDirty = true; return;
+    case HID_KEY_DOWN:      inputClearDeadKey(); editorMoveCursorDown();  screenDirty = true; return;
+    case HID_KEY_HOME:      inputClearDeadKey(); editorMoveCursorHome();  screenDirty = true; return;
+    case HID_KEY_END:       inputClearDeadKey(); editorMoveCursorEnd();   screenDirty = true; return;
     case HID_KEY_BACKSPACE: editorDeleteChar();      screenDirty = true; return;
-    case HID_KEY_DELETE:    editorDeleteForward();   screenDirty = true; return;
+    case HID_KEY_DELETE:    inputClearDeadKey(); editorDeleteForward();   screenDirty = true; return;
   }
 
   // CapsLock toggle
@@ -223,18 +260,26 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
     return;
   }
 
-  // Printable character
-  char c = hidToAscii(keyCode, modifiers);
-  if (c != 0) {
-    editorInsertChar(c);
+  // Printable character. inputResolveText() runs the dead-key state machine, so
+  // one key press can produce nothing (an accent was armed), one character, or
+  // two (an accent that had no composed form, followed by the letter).
+  uint32_t cps[2];
+  const int produced = inputResolveText(keyCode, modifiers, cps);
+  for (int i = 0; i < produced; i++) {
+    editorInsertCodepoint(cps[i]);
+  }
+  // Redraw either way: with nothing produced the cursor now shows an armed accent.
+  if (produced > 0 || inputGetPendingDeadKey() != 0) {
     screenDirty = true;
   }
 }
 
 // Open the title edit screen, returning to `returnTo` on confirm/cancel
 static void openTitleEdit(const char* currentTitle, UIState returnTo) {
+  inputClearDeadKey();
   strncpy(renameBuffer, currentTitle, MAX_TITLE_LEN - 1);
   renameBuffer[MAX_TITLE_LEN - 1] = '\0';
+  utf8TrimPartialTail(renameBuffer);
   renameBufferLen = strlen(renameBuffer);
   renameReturnState = returnTo;
   currentState = UIState::RENAME_FILE;
@@ -243,6 +288,9 @@ static void openTitleEdit(const char* currentTitle, UIState returnTo) {
 
 // Handle title edit input
 static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
+  if (keyCode == HID_KEY_ENTER || keyCode == HID_KEY_ESCAPE) {
+    inputClearDeadKey();
+  }
   if (keyCode == HID_KEY_ENTER) {
     if (renameBufferLen > 0) {
       if (renameReturnState == UIState::TEXT_EDITOR) {
@@ -276,8 +324,14 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
   }
 
   if (keyCode == HID_KEY_BACKSPACE) {
+    if (inputGetPendingDeadKey() != 0) {
+      inputClearDeadKey();
+      screenDirty = true;
+      return;
+    }
     if (renameBufferLen > 0) {
-      renameBufferLen--;
+      // Step back a whole character, not a byte — "Diário" must not lose half an á.
+      renameBufferLen = (int)utf8PrevStart(renameBuffer, (size_t)renameBufferLen);
       renameBuffer[renameBufferLen] = '\0';
       screenDirty = true;
     }
@@ -285,16 +339,27 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
   }
 
   // Allow all printable characters in a title (including spaces)
-  char c = hidToAscii(keyCode, modifiers);
-  if (c != 0 && c >= ' ' && renameBufferLen < MAX_TITLE_LEN - 1) {
-    renameBuffer[renameBufferLen++] = c;
+  uint32_t cps[2];
+  const int produced = inputResolveText(keyCode, modifiers, cps);
+  for (int i = 0; i < produced; i++) {
+    if (cps[i] < ' ') continue;                    // no newline or tab in a title
+    char enc[4];
+    const int len = utf8Encode(cps[i], enc);
+    if (len <= 0 || renameBufferLen + len >= MAX_TITLE_LEN) break;
+    memcpy(renameBuffer + renameBufferLen, enc, (size_t)len);
+    renameBufferLen += len;
     renameBuffer[renameBufferLen] = '\0';
+  }
+  if (produced > 0 || inputGetPendingDeadKey() != 0) {
     screenDirty = true;
   }
 }
 
 static void dispatchEvent(const KeyEvent& event) {
   if (!event.pressed) return;
+
+  lastKeyHid = event.keyCode;
+  lastKeyMods = event.modifiers;
 
   switch (currentState) {
     case UIState::MAIN_MENU: {
@@ -380,7 +445,9 @@ static void dispatchEvent(const KeyEvent& event) {
       break;
 
     case UIState::SETTINGS: {
-      const int SETTINGS_COUNT = 6;  // Orientation, Dark Mode, Writing Mode, Font Size, Bluetooth, Paired Keyboards
+      // Orientation, Dark Mode, Writing Mode, Font Size, Keyboard, Sleep Screen,
+      // Sleep Light, Bluetooth, Paired Keyboards
+      const int SETTINGS_COUNT = 9;
 
       // Up/Down: navigate settings list (physical buttons also map here)
       if (event.keyCode == HID_KEY_DOWN) {
@@ -404,8 +471,18 @@ static void dispatchEvent(const KeyEvent& event) {
           int v = static_cast<int>(fontSize);
           fontSize = static_cast<FontSize>((v + 1) % 3);
         } else if (settingsSelection == 4) {
-          currentState = UIState::BLUETOOTH_SETTINGS;
+          keyboardLayout = static_cast<KeyboardLayout>(
+              (static_cast<int>(keyboardLayout) + 1) % 3);
+          inputClearDeadKey();   // don't carry an armed accent across the switch
         } else if (settingsSelection == 5) {
+          sleepScreenMode = static_cast<SleepScreenMode>(
+              (static_cast<int>(sleepScreenMode) + 1) % 3);
+        } else if (settingsSelection == 6) {
+          sleepBrightness = static_cast<SleepBrightness>(
+              (static_cast<int>(sleepBrightness) + 1) % 3);
+        } else if (settingsSelection == 7) {
+          currentState = UIState::BLUETOOTH_SETTINGS;
+        } else if (settingsSelection == 8) {
           pairedKeyboardSelection = 0;
           currentState = UIState::PAIRED_KEYBOARDS;
         }
@@ -424,6 +501,16 @@ static void dispatchEvent(const KeyEvent& event) {
         } else if (settingsSelection == 3) {
           int v = static_cast<int>(fontSize);
           fontSize = static_cast<FontSize>((v - 1 + 3) % 3);
+        } else if (settingsSelection == 4) {
+          keyboardLayout = static_cast<KeyboardLayout>(
+              (static_cast<int>(keyboardLayout) + 2) % 3);
+          inputClearDeadKey();
+        } else if (settingsSelection == 5) {
+          sleepScreenMode = static_cast<SleepScreenMode>(
+              (static_cast<int>(sleepScreenMode) + 2) % 3);
+        } else if (settingsSelection == 6) {
+          sleepBrightness = static_cast<SleepBrightness>(
+              (static_cast<int>(sleepBrightness) + 2) % 3);
         }
         screenDirty = true;
 

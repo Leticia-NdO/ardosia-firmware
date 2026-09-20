@@ -84,6 +84,33 @@ static constexpr int MAX_LINES = 1024;
 #define FONT_SMALL   (-1246724383)   // UI_10_FONT_ID (ubuntu 10)
 #define FONT_LARGE   (-1422711852)   // NOTOSANS_16_FONT_ID
 
+// --- Keyboard layout ---
+// A BLE keyboard reports keys by PHYSICAL POSITION, not by what is printed on
+// the keycap, so the layout cannot be detected — it has to be told. Usage 0x34
+// is the apostrophe on US ANSI and the ~/^ key on ABNT2; reading an ABNT2 board
+// with the US map is what turns a ~ keypress into ä.
+//
+//   US       plain US ANSI: ' " ` ~ ^ are literal characters
+//   US_INTL  US ANSI with dead keys, the only way to reach á ã ç on a board
+//            that has no accent keys ('a -> á, 'c -> ç)
+//   ABNT2    Brazilian ISO board: real Ç key, ´` and ~^ dead keys
+enum class KeyboardLayout : uint8_t { US = 0, US_INTL = 1, ABNT2 = 2 };
+
+// --- Sleep screen ---
+// TEXT is the built-in "MicroSlate / Asleep" card. The others draw a BMP from
+// the SD card (/sleep/, /.sleep/, or /sleep.bmp) and fall back to TEXT when
+// there is nothing usable to draw.
+enum class SleepScreenMode : uint8_t {
+  TEXT      = 0,
+  SLIDESHOW = 1,   // next image in the folder, each time it sleeps
+  SHUFFLE   = 2    // random image, never the same one twice running
+};
+
+// --- Sleep wallpaper tone ---
+// How dark the halftone of a wallpaper comes out. See sleep_layout.cpp: the
+// panel is 1-bit, so tone is density of black dots, and this picks how dense.
+enum class SleepBrightness : uint8_t { NORMAL = 0, LIGHT = 1, LIGHTER = 2 };
+
 // --- Font Size ---
 enum class FontSize : uint8_t { SMALL = 0, MEDIUM = 1, LARGE = 2 };
 
