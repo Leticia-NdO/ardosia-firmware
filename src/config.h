@@ -97,7 +97,7 @@ static constexpr int MAX_LINES = 1024;
 enum class KeyboardLayout : uint8_t { US = 0, US_INTL = 1, ABNT2 = 2 };
 
 // --- Sleep screen ---
-// TEXT is the built-in "MicroSlate / Asleep" card. The others draw a BMP from
+// TEXT is the built-in "Ardosia / Asleep" card. The others draw a BMP from
 // the SD card (/sleep/, /.sleep/, or /sleep.bmp) and fall back to TEXT when
 // there is nothing usable to draw.
 enum class SleepScreenMode : uint8_t {

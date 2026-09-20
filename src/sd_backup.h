@@ -2,6 +2,27 @@
 #include <SDCardManager.h>
 #include <cstring>
 
+// All SD backups of this fork live in one folder. Kept as a constant so a
+// future rename cannot miss a call site — this one has already been renamed once.
+static constexpr char SD_BACKUP_DIR[] = "/ardosia";
+
+static inline void sdEnsureBackupDir() {
+    if (!SdMan.exists(SD_BACKUP_DIR)) SdMan.mkdir(SD_BACKUP_DIR);
+}
+
+// One-time migration for the MicroSlate -> Ardosia rename: the backup folder
+// used to be /microslate. Wi-Fi credentials, BLE pairings and UI prefs also live
+// in NVS, so this only matters after a wipe — but the SD copy is precisely what
+// is supposed to survive one, so moving it is worth four lines.
+// SdFat renames subdirectories (FatFile::rename accepts isSubDir and fixes the
+// ".." entry), so this moves all three backups at once.
+// TEMPORARY: delete once every card in use has booted this firmware.
+static inline void sdMigrateLegacyBackupDir() {
+    if (SdMan.exists(SD_BACKUP_DIR)) return;
+    if (!SdMan.exists("/microslate")) return;
+    SdMan.rename("/microslate", SD_BACKUP_DIR);
+}
+
 // Read entire file into buf. Returns false if missing or too large.
 static inline bool sdReadFile(const char* path, char* buf, size_t bufSize) {
     if (!SdMan.exists(path)) return false;

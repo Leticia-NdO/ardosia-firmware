@@ -259,7 +259,7 @@ void setup() {
   dropLegacyDiagKeys();
 
   DBG_INIT();
-  DBG_PRINTLN("MicroSlate starting...");
+  DBG_PRINTLN("Ardosia starting...");
 
   setCpuFrequencyMhz(80);
 
@@ -300,10 +300,14 @@ void setup() {
   inputSetup();
   fileManagerSetup();
 
+  // Must run after the card is mounted (fileManagerSetup) and before anything
+  // reads a backup: the UI prefs restore below, bleSetup(), and Wi-Fi sync later.
+  sdMigrateLegacyBackupDir();
+
   // Restore UI prefs from SD backup if NVS was wiped by a firmware flash
   if (!uiPrefs.isKey("orient")) {
     static char uiBuf[128];
-    if (sdReadFile("/microslate/ui_prefs.json", uiBuf, sizeof(uiBuf))) {
+    if (sdReadFile("/ardosia/ui_prefs.json", uiBuf, sizeof(uiBuf))) {
       int o  = jsonGetInt(uiBuf, "orient");
       int d  = jsonGetInt(uiBuf, "dark");
       int wm = jsonGetInt(uiBuf, "writeMode");
@@ -351,10 +355,10 @@ void setup() {
   autoReconnectEnabled = true;
 
   // Register this app's name in shared NVS and detect other OTA apps
-  registerOtaAppName("MicroSlate");
+  registerOtaAppName("Ardosia");
   detectOtaApps();
 
-  DBG_PRINTLN("MicroSlate ready.");
+  DBG_PRINTLN("Ardosia ready.");
 
   // The display needs one FULL_REFRESH after power-on to initialize its analog
   // circuits before FAST_REFRESH will work.
@@ -695,8 +699,8 @@ void renderSleepScreen() {
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
 
-  // Title: "MicroSlate"
-  const char* title = "MicroSlate";
+  // Title: "Ardosia"
+  const char* title = "Ardosia";
   int titleWidth = renderer.getTextAdvanceX(FONT_BODY, title);
   int titleX = (sw - titleWidth) / 2;
   int titleY = sh * 0.35; // 35% down the screen (moved up)
@@ -837,8 +841,8 @@ void loop() {
              (int)currentOrientation, darkMode ? 1 : 0,
              (int)writingMode, (int)fontSize, showWordCount ? 1 : 0,
              (int)keyboardLayout, (int)sleepScreenMode, (int)sleepBrightness);
-    if (!SdMan.exists("/microslate")) SdMan.mkdir("/microslate");
-    sdWriteFile("/microslate/ui_prefs.json", uiBuf);
+    sdEnsureBackupDir();
+    sdWriteFile("/ardosia/ui_prefs.json", uiBuf);
   }
 
   // Check for idle timeout (skip while WiFi sync is active)

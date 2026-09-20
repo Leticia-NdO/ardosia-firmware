@@ -267,7 +267,7 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
   // Title
-  renderer.drawCenteredText(FONT_BODY, 30, "MicroSlate", tc, EpdFontFamily::BOLD);
+  renderer.drawCenteredText(FONT_BODY, 30, "Ardosia", tc, EpdFontFamily::BOLD);
 
   // Menu items (base + dynamically detected OTA apps)
   static const char* baseMenuItems[] = {"Browse Files", "New Note", "Settings", "Sync"};

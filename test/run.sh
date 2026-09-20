@@ -24,13 +24,13 @@ fi
 
 status=0
 
-$CXX $FLAGS -o /tmp/microslate_test_ptbr \
+$CXX $FLAGS -o /tmp/ardosia_test_ptbr \
     test_ptbr.cpp ../src/utf8_util.cpp ../src/deadkeys.cpp ../src/keymap.cpp ../src/text_editor.cpp
-/tmp/microslate_test_ptbr || status=1
+/tmp/ardosia_test_ptbr || status=1
 
 echo
-$CXX $FLAGS -o /tmp/microslate_test_sleep \
+$CXX $FLAGS -o /tmp/ardosia_test_sleep \
     test_sleep.cpp ../src/sleep_layout.cpp
-/tmp/microslate_test_sleep || status=1
+/tmp/ardosia_test_sleep || status=1
 
 exit $status

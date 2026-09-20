@@ -1,6 +1,11 @@
-# MicroSlate
+# Ardosia
 
 A dedicated writing firmware for the **Xteink X4** e-paper device. Pairs with any **Bluetooth LE (BLE)** keyboard and saves notes to MicroSD.
+
+Ardosia is a fork of [MicroSlate](https://github.com/Josh-writes/microslate-firmware)
+for the Xteink X4, adding support for USB-locked devices (recovery through the
+Escape Hatch), Brazilian Portuguese input (ABNT2, dead keys, UTF-8) and
+customisable sleep screens.
 
 ## Features
 
@@ -20,7 +25,7 @@ A dedicated writing firmware for the **Xteink X4** e-paper device. Pairs with an
 - **Power Management** — ESP-IDF light sleep between loop iterations (CPU drops to 10MHz), BLE modem sleep keeps the radio alive, SD card sleeps between accesses, display analog circuits power down after each refresh, and the device enters deep sleep after 5 minutes of inactivity
 - **WiFi Sync** — one-button backup of all notes to your PC over WiFi. Saves network credentials for instant reconnect. Read-only server — nothing on the device can be modified over the network
 - **Standalone Build** — all libraries are bundled in the repo; no sibling projects required
-- **Dual-Boot** — optional combined firmware that includes CrossPoint (an e-reader) in a second OTA slot. A "CrossPoint" entry appears in the main menu; selecting it reboots into the reader. CrossPoint gains a reciprocal "MicroSlate" entry. Both apps work normally when flashed standalone.
+- **Dual-Boot** — optional combined firmware that includes CrossPoint (an e-reader) in a second OTA slot. A "CrossPoint" entry appears in the main menu; selecting it reboots into the reader. CrossPoint gains a reciprocal "Ardosia" entry. Both apps work normally when flashed standalone.
 - **Settings Backup** — BLE pairing info, WiFi credentials, and UI preferences are backed up to the SD card as JSON files. They are silently restored after a firmware flash so you don't need to re-pair your keyboard or re-enter WiFi passwords.
 
 ## Hardware Requirements
@@ -31,33 +36,33 @@ A dedicated writing firmware for the **Xteink X4** e-paper device. Pairs with an
 
 ## Installation
 
-### Option 1 — Browser installer (recommended)
-
-No software required. Works on Windows and Mac in Chrome or Edge.
-
-**[Install MicroSlate → typeslate.com/tools/microslate](https://typeslate.com/tools/microslate/)**
-
-Connect your Xteink X4 via USB and click **Install MicroSlate** for the standalone firmware, or **Install Dual-Boot** to get MicroSlate + CrossPoint on the same device. Takes about 2 minutes.
-
-### Option 2 — Build from source
-
 Requires a Windows or Linux x86_64 machine (the ESP-IDF toolchain does not support Mac ARM or Raspberry Pi).
 
 **Prerequisites**
 
 - [PlatformIO](https://platformio.org/install/) (CLI or VS Code extension)
-- USB cable to connect to the Xteink X4
 
 ```bash
 # Clone the repository
-git clone https://github.com/Josh-writes/microslate-firmware
-cd xteink-writer-firmware
+git clone https://github.com/Leticia-NdO/ardosia-firmware
+cd ardosia-firmware
 
-# Build and upload (adjust port if needed)
-pio run --target upload --upload-port /dev/ttyUSB0
+# Build
+pio run
 ```
 
-The upload port defaults to `COM5` in `platformio.ini`.
+Ardosia targets units whose `serial download` is disabled by eFuse, so it is
+flashed **from the SD card**, not over USB:
+
+1. Copy `.pio/build/xteink_x4/firmware.bin` to the card under a descriptive name
+   (**not** `update.bin` — the boot combo flashes that path unconditionally)
+2. Hold **Back + Up** while powering on to reach the Escape Hatch
+3. Choose *Flash Firmware* and select the `.bin`
+
+Upstream MicroSlate also offers a browser installer at
+[typeslate.com/tools/microslate](https://typeslate.com/tools/microslate/). It
+installs **upstream MicroSlate, not Ardosia**, and it needs a device that still
+accepts USB flashing.
 
 All libraries are included in the `lib/` directory. The only external dependency fetched automatically by PlatformIO is **esp-nimble-cpp** (BLE stack).
 
@@ -195,7 +200,7 @@ Back up all notes from the device to your PC over WiFi. The device and PC must b
 chmod +x sync/install_sync.sh && sync/install_sync.sh
 ```
 
-That's it. The script starts immediately and will run silently in the background on every login. When a sync completes, a desktop notification lists the files that were downloaded (Windows balloon, macOS notification, or Linux `notify-send`). Notes are saved to `Documents/MicroSlate Notes/` by default (edit `LOCAL_DIR` in `microslate_sync.py` to change).
+That's it. The script starts immediately and will run silently in the background on every login. When a sync completes, a desktop notification lists the files that were downloaded (Windows balloon, macOS notification, or Linux `notify-send`). Notes are saved to `Documents/Ardosia Notes/` by default (edit `LOCAL_DIR` in `ardosia_sync.py` to change).
 
 To stop auto-start later:
 - **Windows** — double-click **`sync\uninstall_sync.bat`**
@@ -211,7 +216,7 @@ To stop auto-start later:
 
 If the sync script isn't running, you can start it manually:
 ```bash
-python3 sync/microslate_sync.py
+python3 sync/ardosia_sync.py
 ```
 
 #### How sync works
@@ -239,7 +244,7 @@ Files are fully compatible with any text editor on a computer. To add notes manu
 ## Project Structure
 
 ```
-xteink-writer-firmware/
+ardosia-firmware/
 ├── src/
 │   ├── main.cpp          — setup, main loop, shared UI state
 │   ├── sd_backup.h       — inline SD/JSON helpers for NVS backup and restore
@@ -251,7 +256,7 @@ xteink-writer-firmware/
 │   ├── wifi_sync.cpp     — WiFi sync server and state machine
 │   └── config.h          — enums, buffer sizes, constants
 ├── sync/
-│   ├── microslate_sync.py   — PC sync script (Python, cross-platform)
+│   ├── ardosia_sync.py      — PC sync script (Python, cross-platform)
 │   ├── install_sync.bat     — register auto-start on Windows login
 │   ├── uninstall_sync.bat   — remove auto-start on Windows
 │   ├── install_sync.sh      — register auto-start on macOS / Linux
@@ -287,11 +292,15 @@ xteink-writer-firmware/
 
 ---
 
-## More from TypeSlate
+## Credits
 
-MicroSlate is the hardware companion to **TypeSlate** — a free, full-screen distraction-free writing app for Windows. Same idea, different form factor: open it, write, close it.
+Ardosia is a fork of **MicroSlate** by Josh (TypeSlate). The upstream project is
+where almost all of this firmware comes from — support it at
+[ko-fi.com/typeslate](https://ko-fi.com/typeslate).
 
-- **TypeSlate for Windows** — free on the [Microsoft Store](https://apps.microsoft.com/detail/9PM3J9SQB0TV?hl=en-us&gl=US&ocid=pdpshare)
-- **Website** — [typeslate.com](https://typeslate.com)
+- **MicroSlate** — [github.com/Josh-writes/microslate-firmware](https://github.com/Josh-writes/microslate-firmware)
+- **TypeSlate** — [typeslate.com](https://typeslate.com), a distraction-free writing app for Windows
 
-If MicroSlate is useful to you and you'd like to say thanks, you can support the project at [ko-fi.com/typeslate](https://ko-fi.com/typeslate).
+`lib/RecoveryBoot/` is vendored from the [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk)
+and the bundled `lib/` display, font, input and SD libraries come from
+[crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader) (MIT).

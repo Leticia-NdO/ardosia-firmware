@@ -1,13 +1,13 @@
 """
-MicroSlate Sync — One-way backup from device to PC.
+Ardosia Sync — One-way backup from device to PC.
 
 Downloads all notes from the device to a local folder.  Files on
 the PC that don't exist on the device are left untouched (they
 serve as a backup archive).  Nothing is ever uploaded or deleted.
 
 Usage:
-  python microslate_sync.py          (foreground, console output)
-  pythonw.exe microslate_sync.py     (background, log-only)
+  python ardosia_sync.py          (foreground, console output)
+  pythonw.exe ardosia_sync.py     (background, log-only)
 
 Dependencies: requests  (pip install requests)
 """
@@ -19,10 +19,10 @@ import subprocess
 import requests
 
 # --- Configuration ---
-DEVICE_URL = "http://microslate.local"
+DEVICE_URL = "http://ardosia.local"
 POLL_INTERVAL = 5  # seconds between connection attempts
-LOCAL_DIR = os.path.expanduser("~/OneDrive/Documents/MicroSlate Notes")
-LOG_FILE = os.path.join(LOCAL_DIR, "microslate_sync.log")
+LOCAL_DIR = os.path.expanduser("~/OneDrive/Documents/Ardosia Notes")
+LOG_FILE = os.path.join(LOCAL_DIR, "ardosia_sync.log")
 
 # --- Setup ---
 
@@ -127,7 +127,7 @@ def sync_once(device_files):
 
 
 def main():
-    log.info("MicroSlate Sync started")
+    log.info("Ardosia Sync started")
     log.info("Local folder: %s", LOCAL_DIR)
     log.info("Device URL:   %s", DEVICE_URL)
     log.info("Waiting for device...")
@@ -144,10 +144,10 @@ def main():
                     msg = f"{len(downloaded)} of {total} files downloaded"
                     if unchanged > 0:
                         msg += f"\n{unchanged} already up to date"
-                    notify("MicroSlate Sync", msg)
+                    notify("Ardosia Sync", msg)
                 else:
                     log.info("Sync complete: all %d files up to date", total)
-                    notify("MicroSlate Sync", f"All {total} files up to date")
+                    notify("Ardosia Sync", f"All {total} files up to date")
                 signal_sync_complete()
             except Exception as e:
                 log.error("Sync error: %s", e)

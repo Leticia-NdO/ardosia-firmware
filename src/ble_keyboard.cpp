@@ -553,7 +553,7 @@ static void nvs_clearSlot(int idx) {
 
 // --- SD card backup for BLE pairing ---
 
-static constexpr char BLE_BACKUP_PATH[] = "/microslate/ble_kb.json";
+static constexpr char BLE_BACKUP_PATH[] = "/ardosia/ble_kb.json";
 
 static void writeBleBackup() {
     static char buf[512];
@@ -573,7 +573,7 @@ static void writeBleBackup() {
         strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
     }
     strncat(buf, "}", sizeof(buf) - strlen(buf) - 1);
-    if (!SdMan.exists("/microslate")) SdMan.mkdir("/microslate");
+    sdEnsureBackupDir();
     sdWriteFile(BLE_BACKUP_PATH, buf);
 }
 
@@ -606,7 +606,7 @@ uint32_t getCurrentPasskey() {
 }
 
 void bleSetup() {
-  NimBLEDevice::init("MicroSlate");
+  NimBLEDevice::init("Ardosia");
   // bond=true, MITM=false (we don't require it), SC=false (legacy compat for Logitech etc.)
   // DISPLAY_YESNO: we can show a number and confirm — lets keyboards that *do* want
   // numeric comparison (Apple Magic Keyboard, etc.) initiate it while still falling

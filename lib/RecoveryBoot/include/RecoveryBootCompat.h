@@ -1,10 +1,10 @@
 #pragma once
 
 // -----------------------------------------------------------------------------
-// RecoveryBoot compatibility shim — MicroSlate fork
+// RecoveryBoot compatibility shim — Ardosia fork
 // -----------------------------------------------------------------------------
 // RecoveryBoot comes from the FreeInk SDK, which builds against the pioarduino
-// platform (Arduino core 3.x / ESP-IDF 5.x). MicroSlate builds against
+// platform (Arduino core 3.x / ESP-IDF 5.x). Ardosia builds against
 // espressif32 @ 6.12.0 (Arduino core 2.x / ESP-IDF 4.4), where two APIs the SDK
 // relies on live somewhere else. This header papers over both so the SDK
 // sources need only swap one #include.
