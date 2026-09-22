@@ -42,3 +42,38 @@ int countNoteFiles();
 // How many leading '\n' to write before appending so the new block is
 // separated from existing content by a blank line. 0 if `len` is 0.
 int noteAppendPrefixNewlines(const char* existing, size_t len);
+
+// Title search. Empty query matches everything. Both sides are folded
+// (lowercase, accents stripped) so "ação" finds the title "Acao", and a
+// fragment matches: "rio" finds "Diario".
+bool noteTitleMatches(const char* title, const char* query);
+
+// <0 if a belongs before b. Equal seq/title falls through to the title,
+// so the list does not jump around.
+int noteCompare(const FileInfo* a, const FileInfo* b, NoteSort mode);
+
+// One-time numbering for notes that have no sequence yet. fatKey 0 means
+// "no real date" (the 1980 epoch). Dated files come first, oldest first;
+// undated files follow, A–Z. seqOut[i] receives 1..n. Returns the next
+// sequence number to hand out (n+1).
+struct NoteSeqSeed {
+  const char* title;
+  uint32_t fatKey;
+};
+uint32_t noteAssignInitialSeq(const NoteSeqSeed* items, int n, uint32_t* seqOut);
+
+// Live title filter over the already-sorted list. The query stored here is
+// the folded text, which is also what the footer shows.
+void noteFilterPushCodepoint(uint32_t cp);
+void noteFilterBackspace();
+void noteFilterClear();
+const char* noteFilterText();
+int noteVisibleCount();
+FileInfo* noteVisibleAt(int index);
+void noteClampSelection(int* index);
+
+// Drops the in-memory sequence table so the next refresh reloads the card.
+void noteIndexInvalidate();
+
+// Give a just-created note the next creation number. No-op if it already has one.
+void noteSeqAssignNew(const char* name);

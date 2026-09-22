@@ -34,12 +34,19 @@ static void checkStr(const char* got, const char* want, const char* what) {
 
 // Defined in main.cpp on device; file_manager.cpp declares it extern.
 UIState currentState = UIState::MAIN_MENU;
+NoteSort noteSort = NoteSort::ALPHA_ASC;
 
 static void resetFs() {
   SdMan.testReset();
   SdMan.mkdir("/notes");
+  noteIndexInvalidate();
+  noteFilterClear();
   currentState = UIState::MAIN_MENU;
   editorInit();
+}
+
+static uint16_t dosDate(int year, int month, int day) {
+  return static_cast<uint16_t>(((year - 1980) << 9) | (month << 5) | day);
 }
 
 // ---------------------------------------------------------------------------
@@ -289,7 +296,76 @@ static void testLoadFileGuard() {
   check(!editorIsReadOnly(), "new note is writable");
 }
 
+static void testSearchAndSort() {
+  printf("note search and sort\n");
+
+  check(noteTitleMatches("Diario", "rio"), "fragment matches inside the title");
+  check(noteTitleMatches("Diario", "DIA"), "match ignores case");
+  check(noteTitleMatches("Coracao", "ção"), "query accent folds the same way as the title");
+  check(noteTitleMatches("Dom Casmurro", "dom cas"), "a fragment may include a space");
+  check(!noteTitleMatches("Diario", "nota"), "unrelated query does not match");
+  check(noteTitleMatches("Diario", ""), "empty query matches everything");
+  check(noteTitleMatches("Diario", "\xC2\xB7"), "a mark with no ASCII fold matches everything");
+
+  FileInfo a{};
+  FileInfo b{};
+  strncpy(a.title, "Alpha", MAX_TITLE_LEN - 1);
+  strncpy(b.title, "Beta", MAX_TITLE_LEN - 1);
+  strncpy(a.filename, "alpha.txt", MAX_FILENAME_LEN - 1);
+  strncpy(b.filename, "beta.txt", MAX_FILENAME_LEN - 1);
+  a.modTime = 1;
+  b.modTime = 2;
+  check(noteCompare(&a, &b, NoteSort::ALPHA_ASC) < 0, "A-Z puts Alpha before Beta");
+  check(noteCompare(&a, &b, NoteSort::ALPHA_DESC) > 0, "Z-A puts Beta before Alpha");
+  check(noteCompare(&a, &b, NoteSort::NEWEST) > 0, "newest puts the higher number first");
+  check(noteCompare(&a, &b, NoteSort::OLDEST) < 0, "oldest puts the lower number first");
+
+  FileInfo tie = a;
+  tie.modTime = a.modTime;
+  strncpy(tie.title, "Beta", MAX_TITLE_LEN - 1);
+  strncpy(tie.filename, "beta.txt", MAX_FILENAME_LEN - 1);
+  check(noteCompare(&a, &tie, NoteSort::NEWEST) < 0, "equal creation number falls through to the title");
+
+  NoteSeqSeed seeds[3] = {
+      {"Zed", 0},
+      {"Mid", dosDate(2024, 6, 2)},
+      {"Old", dosDate(2020, 1, 1)},
+  };
+  // fatKey is (date<<16)|time. Rebuild seeds with the packed key.
+  seeds[1].fatKey = (static_cast<uint32_t>(dosDate(2024, 6, 2)) << 16) | 1;
+  seeds[2].fatKey = (static_cast<uint32_t>(dosDate(2020, 1, 1)) << 16) | 1;
+  uint32_t seq[3] = {};
+  const uint32_t next = noteAssignInitialSeq(seeds, 3, seq);
+  check(next == 4, "next sequence sits above the numbers just handed out");
+  check(seq[2] == 1, "older real date is number 1");
+  check(seq[1] == 2, "newer real date follows it");
+  check(seq[0] == 3, "undated file comes after every dated one");
+
+  resetFs();
+  SdMan.testAddFile("/notes/beta.txt", "b");
+  SdMan.testAddFile("/notes/alpha.txt", "a");
+  noteSort = NoteSort::ALPHA_ASC;
+  refreshFileList();
+  check(getFileCount() == 2, "both notes are listed");
+  checkStr(getFileList()[0].title, "Alpha", "A-Z lists Alpha first");
+  checkStr(getFileList()[1].title, "Beta", "A-Z lists Beta second");
+  check(getFileList()[0].modTime < getFileList()[1].modTime, "undated notes are numbered in A-Z order");
+
+  noteSort = NoteSort::NEWEST;
+  refreshFileList();
+  checkStr(getFileList()[0].title, "Beta", "newest lists the later number first");
+
+  noteFilterPushCodepoint('e');
+  noteFilterPushCodepoint('t');
+  check(noteVisibleCount() == 1, "fragment hides the other note");
+  checkStr(noteVisibleAt(0)->title, "Beta", "et matches Beta");
+  noteFilterClear();
+  check(noteVisibleCount() == 2, "clearing the filter shows both notes again");
+  noteSort = NoteSort::ALPHA_ASC;
+}
+
 int main() {
+  testSearchAndSort();
   testTitleToFilename();
   testBoundedDecoder();
   testUtf8Validate();

@@ -89,6 +89,13 @@ bool SDCardManager::rename(const char* path, const char* newPath) {
 
 void SDCardManager::testReset() { nodes.clear(); }
 
+void SDCardManager::testSetCreateDate(const char* path, uint16_t date, uint16_t time) {
+  auto it = nodes.find(norm(path));
+  if (it == nodes.end()) return;
+  it->second.createDate = date;
+  it->second.createTime = time;
+}
+
 void SDCardManager::testAddFile(const char* path, const std::string& content) {
   const std::string p = norm(path);
   Node n;
@@ -156,6 +163,15 @@ uint32_t FsFile::size() const {
   auto it = SdMan.nodes.find(path);
   if (it == SdMan.nodes.end()) return 0;
   return static_cast<uint32_t>(it->second.data.size());
+}
+
+bool FsFile::getCreateDateTime(uint16_t* pdate, uint16_t* ptime) const {
+  auto it = SdMan.nodes.find(path);
+  if (it == SdMan.nodes.end()) return false;
+  if (it->second.createDate == 0 && it->second.createTime == 0) return false;
+  if (pdate) *pdate = it->second.createDate;
+  if (ptime) *ptime = it->second.createTime;
+  return true;
 }
 
 size_t FsFile::write(const uint8_t* data, size_t n) {

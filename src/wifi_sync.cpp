@@ -664,6 +664,7 @@ class NotesPostHandler : public RequestHandler {
     }
     const unsigned long sz = (unsigned long)file.size();
     file.close();
+    if (creating) noteSeqAssignNew(chosenName);
 
     char json[160];
     snprintf(json, sizeof(json),

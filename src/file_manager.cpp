@@ -3,12 +3,34 @@
 #include "utf8_util.h"
 #include <Arduino.h>
 #include <SDCardManager.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
 // --- File list ---
 static FileInfo fileList[MAX_FILES];
 static int fileCount = 0;
+
+// Set by main from the persisted setting. Tests set it directly.
+extern NoteSort noteSort;
+
+// Creation order. The FAT clock is not trustworthy, so each note gets a
+// monotonic number the first time we see it. Newest is the highest number.
+struct NoteSeqEntry {
+  char name[MAX_FILENAME_LEN];
+  uint32_t seq;
+};
+static NoteSeqEntry noteSeq[MAX_FILES];
+static int noteSeqCount = 0;
+static uint32_t noteSeqNext = 1;
+static bool noteSeqLoaded = false;
+
+static char noteFilter[MAX_TITLE_LEN];
+static int visibleIndex[MAX_FILES];
+static int visibleCount = 0;
+
+static constexpr uint32_t NOTE_SEQ_MAGIC = 0x4E534551;  // 'NSEQ'
+static constexpr char NOTE_SEQ_PATH[] = "/.ardosia/note_seq.bin";
 
 // Shared state
 extern UIState currentState;
@@ -65,6 +87,75 @@ static char foldToAscii(uint32_t cp) {
     case 0x00FD: case 0x00FF:              return 'y';
     default:                               return 0;
   }
+}
+
+static void foldToKey(const char* in, char* out, int maxLen) {
+  if (maxLen <= 0) return;
+  int j = 0;
+  if (in == nullptr) {
+    out[0] = '\0';
+    return;
+  }
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(in);
+  const unsigned char* end = p + strlen(in);
+  uint32_t cp;
+  while ((cp = utf8NextCodepointBounded(&p, end)) != 0 && j < maxLen - 1) {
+    char c = foldToAscii(cp);
+    if (c == 0) continue;
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+    out[j++] = c;
+  }
+  out[j] = '\0';
+}
+
+bool noteTitleMatches(const char* title, const char* query) {
+  if (query == nullptr || query[0] == '\0') return true;
+  char foldedQuery[MAX_TITLE_LEN];
+  char foldedTitle[MAX_TITLE_LEN];
+  foldToKey(query, foldedQuery, MAX_TITLE_LEN);
+  foldToKey(title, foldedTitle, MAX_TITLE_LEN);
+  if (foldedQuery[0] == '\0') return true;
+  return strstr(foldedTitle, foldedQuery) != nullptr;
+}
+
+int noteCompare(const FileInfo* a, const FileInfo* b, NoteSort mode) {
+  if (a == nullptr || b == nullptr) return 0;
+  const int byTitle = strcasecmp(a->title, b->title);
+  switch (mode) {
+    case NoteSort::ALPHA_DESC:
+      if (byTitle != 0) return -byTitle;
+      return strcasecmp(a->filename, b->filename);
+    case NoteSort::NEWEST:
+      if (a->modTime != b->modTime) return (a->modTime > b->modTime) ? -1 : 1;
+      return byTitle;
+    case NoteSort::OLDEST:
+      if (a->modTime != b->modTime) return (a->modTime < b->modTime) ? -1 : 1;
+      return byTitle;
+    case NoteSort::ALPHA_ASC:
+    default:
+      if (byTitle != 0) return byTitle;
+      return strcasecmp(a->filename, b->filename);
+  }
+}
+
+uint32_t noteAssignInitialSeq(const NoteSeqSeed* items, int n, uint32_t* seqOut) {
+  if (n <= 0 || items == nullptr || seqOut == nullptr) return 1;
+  if (n > MAX_FILES) n = MAX_FILES;
+  int order[MAX_FILES];
+  for (int i = 0; i < n; i++) order[i] = i;
+  std::sort(order, order + n, [&](int ia, int ib) {
+    const NoteSeqSeed& a = items[ia];
+    const NoteSeqSeed& b = items[ib];
+    const bool aDated = a.fatKey != 0;
+    const bool bDated = b.fatKey != 0;
+    if (aDated != bDated) return aDated;
+    if (aDated && a.fatKey != b.fatKey) return a.fatKey < b.fatKey;
+    const char* at = a.title ? a.title : "";
+    const char* bt = b.title ? b.title : "";
+    return strcasecmp(at, bt) < 0;
+  });
+  for (int rank = 0; rank < n; rank++) seqOut[order[rank]] = static_cast<uint32_t>(rank + 1);
+  return static_cast<uint32_t>(n + 1);
 }
 
 // Convert a title to a valid FAT filename (lowercase, accents folded to ASCII,
@@ -154,17 +245,154 @@ void fileManagerSetup() {
   refreshFileList();
 }
 
+static int noteSeqFind(const char* name) {
+  if (name == nullptr) return -1;
+  for (int i = 0; i < noteSeqCount; i++) {
+    if (strcmp(noteSeq[i].name, name) == 0) return i;
+  }
+  return -1;
+}
+
+static void noteSeqSave() {
+  SdMan.mkdir("/.ardosia");
+  auto file = SdMan.open(NOTE_SEQ_PATH, O_WRONLY | O_CREAT | O_TRUNC);
+  if (!file) return;
+  const uint32_t magic = NOTE_SEQ_MAGIC;
+  const uint8_t version = 1;
+  const uint8_t pad[3] = {0, 0, 0};
+  const uint16_t count = static_cast<uint16_t>(noteSeqCount);
+  const uint16_t pad2 = 0;
+  file.write(reinterpret_cast<const uint8_t*>(&magic), sizeof(magic));
+  file.write(reinterpret_cast<const uint8_t*>(&version), 1);
+  file.write(pad, sizeof(pad));
+  file.write(reinterpret_cast<const uint8_t*>(&noteSeqNext), sizeof(noteSeqNext));
+  file.write(reinterpret_cast<const uint8_t*>(&count), sizeof(count));
+  file.write(reinterpret_cast<const uint8_t*>(&pad2), sizeof(pad2));
+  if (count > 0) {
+    file.write(reinterpret_cast<const uint8_t*>(noteSeq), sizeof(NoteSeqEntry) * count);
+  }
+  file.close();
+}
+
+static void noteSeqLoad() {
+  noteSeqCount = 0;
+  noteSeqNext = 1;
+  noteSeqLoaded = true;
+  auto file = SdMan.open(NOTE_SEQ_PATH, O_RDONLY);
+  if (!file) return;
+  uint32_t magic = 0;
+  uint8_t version = 0;
+  uint8_t pad[3];
+  uint16_t count = 0;
+  uint16_t pad2 = 0;
+  bool ok = file.read(&magic, sizeof(magic)) == (int)sizeof(magic) && magic == NOTE_SEQ_MAGIC &&
+            file.read(&version, 1) == 1 && version == 1 &&
+            file.read(pad, sizeof(pad)) == (int)sizeof(pad) &&
+            file.read(&noteSeqNext, sizeof(noteSeqNext)) == (int)sizeof(noteSeqNext) &&
+            file.read(&count, sizeof(count)) == (int)sizeof(count) &&
+            file.read(&pad2, sizeof(pad2)) == (int)sizeof(pad2);
+  if (!ok || count > MAX_FILES || noteSeqNext == 0) {
+    file.close();
+    noteSeqCount = 0;
+    noteSeqNext = 1;
+    return;
+  }
+  if (count > 0) {
+    const int n = file.read(noteSeq, sizeof(NoteSeqEntry) * count);
+    if (n != (int)(sizeof(NoteSeqEntry) * count)) {
+      file.close();
+      noteSeqCount = 0;
+      noteSeqNext = 1;
+      return;
+    }
+  }
+  file.close();
+  noteSeqCount = count;
+}
+
+static void noteSeqEnsure() {
+  if (!noteSeqLoaded) noteSeqLoad();
+}
+
+static uint32_t fatKeyOf(FsFile& file) {
+  uint16_t date = 0, time = 0;
+  if (!file.getCreateDateTime(&date, &time)) return 0;
+  const int year = (date >> 9) + 1980;
+  if (year <= 1980) return 0;
+  return (static_cast<uint32_t>(date) << 16) | time;
+}
+
+static void rebuildVisible() {
+  visibleCount = 0;
+  for (int i = 0; i < fileCount; i++) {
+    if (noteTitleMatches(fileList[i].title, noteFilter)) {
+      visibleIndex[visibleCount++] = i;
+    }
+  }
+}
+
+static void noteSeqAssignMissing(const uint32_t* fatKeys) {
+  int missing[MAX_FILES];
+  int missingCount = 0;
+  for (int i = 0; i < fileCount; i++) {
+    if (noteSeqFind(fileList[i].filename) < 0) missing[missingCount++] = i;
+  }
+  if (missingCount == 0) return;
+
+  // First time we see the folder: number everything together so a file
+  // copied from a computer (real FAT date) sorts before an undated one.
+  if (noteSeqCount == 0) {
+    NoteSeqSeed seeds[MAX_FILES];
+    uint32_t seqs[MAX_FILES];
+    for (int i = 0; i < fileCount; i++) {
+      seeds[i].title = fileList[i].title;
+      seeds[i].fatKey = fatKeys[i];
+    }
+    noteSeqNext = noteAssignInitialSeq(seeds, fileCount, seqs);
+    for (int i = 0; i < fileCount; i++) {
+      strncpy(noteSeq[i].name, fileList[i].filename, MAX_FILENAME_LEN - 1);
+      noteSeq[i].name[MAX_FILENAME_LEN - 1] = '\0';
+      noteSeq[i].seq = seqs[i];
+      fileList[i].modTime = seqs[i];
+    }
+    noteSeqCount = fileCount;
+    noteSeqSave();
+    return;
+  }
+
+  // A note that showed up later (created here, or posted by the X3) is newer
+  // than everything already numbered.
+  for (int k = 0; k < missingCount && noteSeqCount < MAX_FILES; k++) {
+    const int i = missing[k];
+    strncpy(noteSeq[noteSeqCount].name, fileList[i].filename, MAX_FILENAME_LEN - 1);
+    noteSeq[noteSeqCount].name[MAX_FILENAME_LEN - 1] = '\0';
+    noteSeq[noteSeqCount].seq = noteSeqNext++;
+    fileList[i].modTime = noteSeq[noteSeqCount].seq;
+    noteSeqCount++;
+  }
+  noteSeqSave();
+}
+
+void noteIndexInvalidate() {
+  noteSeqLoaded = false;
+  noteSeqCount = 0;
+  noteSeqNext = 1;
+}
+
 void refreshFileList() {
   fileCount = 0;
+  noteSeqEnsure();
 
   auto root = SdMan.open("/notes");
   if (!root || !root.isDirectory()) {
     if (root) root.close();
+    rebuildVisible();
     return;
   }
 
   root.rewindDirectory();
   char name[256];
+  uint32_t fatKeys[MAX_FILES];
 
   for (auto file = root.openNextFile(); file; file = root.openNextFile()) {
     file.getName(name, sizeof(name));
@@ -178,17 +406,67 @@ void refreshFileList() {
     if (nameLen > 4 && strcasecmp(name + nameLen - 4, ".txt") == 0) {
       strncpy(fileList[fileCount].filename, name, MAX_FILENAME_LEN - 1);
       fileList[fileCount].filename[MAX_FILENAME_LEN - 1] = '\0';
-
       filenameToTitle(name, fileList[fileCount].title, MAX_TITLE_LEN);
-      fileList[fileCount].modTime = 0;
+      fatKeys[fileCount] = fatKeyOf(file);
+      const int slot = noteSeqFind(fileList[fileCount].filename);
+      fileList[fileCount].modTime = slot >= 0 ? noteSeq[slot].seq : 0;
       fileCount++;
     }
     file.close();
   }
   root.close();
+
+  noteSeqAssignMissing(fatKeys);
+
+  std::sort(fileList, fileList + fileCount, [](const FileInfo& a, const FileInfo& b) {
+    return noteCompare(&a, &b, noteSort) < 0;
+  });
+  rebuildVisible();
   SdMan.sleep();
 
   DBG_PRINTF("File listing: %d files found\n", fileCount);
+}
+
+void noteFilterPushCodepoint(uint32_t cp) {
+  char c = foldToAscii(cp);
+  if (c == 0) return;
+  if (c >= 'A' && c <= 'Z') c = static_cast<char>(c + 32);
+  const int len = (int)strlen(noteFilter);
+  if (len >= MAX_TITLE_LEN - 1) return;
+  noteFilter[len] = c;
+  noteFilter[len + 1] = '\0';
+  rebuildVisible();
+}
+
+void noteFilterBackspace() {
+  const int len = (int)strlen(noteFilter);
+  if (len <= 0) return;
+  noteFilter[len - 1] = '\0';
+  rebuildVisible();
+}
+
+void noteFilterClear() {
+  noteFilter[0] = '\0';
+  rebuildVisible();
+}
+
+const char* noteFilterText() { return noteFilter; }
+
+int noteVisibleCount() { return visibleCount; }
+
+FileInfo* noteVisibleAt(int index) {
+  if (index < 0 || index >= visibleCount) return nullptr;
+  return &fileList[visibleIndex[index]];
+}
+
+void noteClampSelection(int* index) {
+  if (index == nullptr) return;
+  if (visibleCount <= 0) {
+    *index = 0;
+    return;
+  }
+  if (*index >= visibleCount) *index = visibleCount - 1;
+  if (*index < 0) *index = 0;
 }
 
 int getFileCount() { return fileCount; }
@@ -234,6 +512,40 @@ void loadFile(const char* filename) {
              tooLarge ? " [read-only, too large]" : "");
 }
 
+void noteSeqAssignNew(const char* name) {
+  if (name == nullptr || name[0] == '\0') return;
+  noteSeqEnsure();
+  if (noteSeqFind(name) >= 0) return;
+  if (noteSeqCount >= MAX_FILES) return;
+  strncpy(noteSeq[noteSeqCount].name, name, MAX_FILENAME_LEN - 1);
+  noteSeq[noteSeqCount].name[MAX_FILENAME_LEN - 1] = '\0';
+  noteSeq[noteSeqCount].seq = noteSeqNext++;
+  noteSeqCount++;
+  noteSeqSave();
+}
+
+static void noteSeqRename(const char* from, const char* to) {
+  if (from == nullptr || to == nullptr || strcmp(from, to) == 0) return;
+  noteSeqEnsure();
+  const int slot = noteSeqFind(from);
+  if (slot < 0) {
+    noteSeqAssignNew(to);
+    return;
+  }
+  strncpy(noteSeq[slot].name, to, MAX_FILENAME_LEN - 1);
+  noteSeq[slot].name[MAX_FILENAME_LEN - 1] = '\0';
+  noteSeqSave();
+}
+
+static void noteSeqForget(const char* name) {
+  noteSeqEnsure();
+  const int slot = noteSeqFind(name);
+  if (slot < 0) return;
+  noteSeq[slot] = noteSeq[noteSeqCount - 1];
+  noteSeqCount--;
+  noteSeqSave();
+}
+
 void saveCurrentFile(bool refreshList) {
   if (editorIsReadOnly()) {
     DBG_PRINTLN("saveCurrentFile: read-only, skipping");
@@ -244,6 +556,7 @@ void saveCurrentFile(bool refreshList) {
 
   char path[320], tmpPath[336], bakPath[336];
   snprintf(path, sizeof(path), "/notes/%s", filename);
+  const bool creating = !SdMan.exists(path);
   snprintf(tmpPath, sizeof(tmpPath), "%s.tmp", path);
   snprintf(bakPath, sizeof(bakPath), "%s.bak", path);
 
@@ -273,6 +586,7 @@ void saveCurrentFile(bool refreshList) {
 
   // Step 4: Promote .tmp → original
   SdMan.rename(tmpPath, path);
+  if (creating) noteSeqAssignNew(filename);
 
   editorSetUnsavedChanges(false);
   if (refreshList) refreshFileList();
@@ -299,6 +613,7 @@ bool updateFileTitle(const char* filename, const char* newTitle) {
     snprintf(oldPath, sizeof(oldPath), "/notes/%s", filename);
     snprintf(newPath, sizeof(newPath), "/notes/%s", newFilename);
     SdMan.rename(oldPath, newPath);
+    noteSeqRename(filename, newFilename);
 
     if (strcmp(editorGetCurrentFile(), filename) == 0) {
       editorSetCurrentFile(newFilename);
@@ -316,6 +631,7 @@ void deleteFile(const char* filename) {
   snprintf(bakPath, sizeof(bakPath), "%s.bak", path);
   SdMan.remove(path);
   SdMan.remove(bakPath);
+  noteSeqForget(filename);
   refreshFileList();
   SdMan.sleep();
   DBG_PRINTF("Deleted: %s\n", filename);

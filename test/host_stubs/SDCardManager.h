@@ -29,6 +29,7 @@ class FsFile {
   int read(void* buf, size_t n);
   uint32_t size() const;
   size_t write(const uint8_t* data, size_t n);
+  bool getCreateDateTime(uint16_t* pdate, uint16_t* ptime) const;
 
   // Filled by SDCardManager::open.
   std::string path;
@@ -55,11 +56,14 @@ class SDCardManager {
   // Test helpers
   void testReset();
   void testAddFile(const char* path, const std::string& content);
+  void testSetCreateDate(const char* path, uint16_t date, uint16_t time);
   std::string testContent(const char* path) const;
 
   struct Node {
     bool isDir = false;
     std::string data;
+    uint16_t createDate = 0;
+    uint16_t createTime = 0;
   };
   std::map<std::string, Node> nodes;
 };

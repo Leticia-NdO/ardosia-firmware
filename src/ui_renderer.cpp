@@ -22,7 +22,6 @@ extern WritingMode writingMode;
 extern FontSize fontSize;
 extern KeyboardLayout keyboardLayout;
 extern SleepScreenMode sleepScreenMode;
-extern SleepBrightness sleepBrightness;
 extern bool showWordCount;
 
 // External functions
@@ -66,6 +65,7 @@ extern UIState currentState;
 extern int mainMenuSelection;
 extern int selectedFileIndex;
 extern int settingsSelection;
+extern NoteSort noteSort;
 extern int bluetoothDeviceSelection;
 extern int pairedKeyboardSelection;
 extern Orientation currentOrientation;
@@ -320,7 +320,7 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
 
-  int fc = getFileCount();
+  int fc = noteVisibleCount();
   const int bandH = bandHeight(FONT_UI);
   const int pitch = rowPitch(FONT_UI);
   int listTop = 42;
@@ -333,21 +333,25 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   }
 
   if (fc == 0) {
-    drawClippedText(renderer, FONT_UI, 20, listTop + 14, "No notes yet.", 0, tc);
-    drawClippedText(renderer, FONT_SMALL, 20, listTop + 14 + lineStep(FONT_UI),
-                    "Press Ctrl+N to create one.", 0, tc);
+    const char* empty = noteFilterText()[0] ? "No matching notes." : "No notes yet.";
+    drawClippedText(renderer, FONT_UI, 20, listTop + 14, empty, 0, tc);
+    if (noteFilterText()[0] == '\0') {
+      drawClippedText(renderer, FONT_SMALL, 20, listTop + 14 + lineStep(FONT_UI),
+                      "Press Ctrl+N to create one.", 0, tc);
+    }
   }
 
-  FileInfo* files = getFileList();
   for (int i = startIdx; i < fc && (i - startIdx) < maxVisible; i++) {
+    FileInfo* note = noteVisibleAt(i);
+    if (note == nullptr) continue;
     int bandTop = listTop + (i - startIdx) * pitch;
     int textY = textYInBand(FONT_UI, bandTop, bandH);
 
     if (i == selectedFileIndex) {
       clippedFillRect(renderer, 5, bandTop, sw - 10, bandH, tc);
-      drawClippedText(renderer, FONT_UI, 15, textY, files[i].title, sw - 30, !tc);
+      drawClippedText(renderer, FONT_UI, 15, textY, note->title, sw - 30, !tc);
     } else {
-      drawClippedText(renderer, FONT_UI, 15, textY, files[i].title, sw - 30, tc);
+      drawClippedText(renderer, FONT_UI, 15, textY, note->title, sw - 30, tc);
     }
   }
 
@@ -355,9 +359,13 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   clippedLine(renderer, 5, ruleY, sw - 5, ruleY, tc);
   if (deleteConfirmPending && fc > 0) {
     drawClippedText(renderer, FONT_SMALL, 10, footerLineY(ruleY, 0), "Delete? Enter:Yes  Esc:No", 0, tc);
+  } else if (noteFilterText()[0] != '\0') {
+    char findBuf[64];
+    snprintf(findBuf, sizeof(findBuf), "Find: %s  (%d)  Esc:Clear", noteFilterText(), fc);
+    drawClippedText(renderer, FONT_SMALL, 10, footerLineY(ruleY, 0), findBuf, sw - 20, tc);
   } else {
     drawClippedText(renderer, FONT_SMALL, 10, footerLineY(ruleY, 0),
-                    "Ctrl+N:Title  Ctrl+D:Delete", 0, tc);
+                    "Type to find   Ctrl+N:Title  Ctrl+D:Delete", 0, tc);
   }
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
@@ -655,7 +663,7 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   // Setting items: Orientation, Dark Mode, Writing Mode, Font Size, Bluetooth, Paired Keyboards
   static const char* labels[] = {
     "Orientation", "Dark Mode", "Writing Mode", "Font Size",
-    "Keyboard", "Sleep Screen", "Sleep Light", "Bluetooth", "Paired Keyboards"
+    "Keyboard", "Sleep Screen", "Note Order", "Bluetooth", "Paired Keyboards"
   };
   const int SETTINGS_COUNT = 9;
 
@@ -717,10 +725,11 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
         default:                         strcpy(val, "Text");      break;
       }
     } else if (i == 6) {
-      switch (sleepBrightness) {
-        case SleepBrightness::LIGHT:   strcpy(val, "Light");   break;
-        case SleepBrightness::LIGHTER: strcpy(val, "Lighter"); break;
-        default:                       strcpy(val, "Normal");  break;
+      switch (noteSort) {
+        case NoteSort::ALPHA_DESC: strcpy(val, "Z-A"); break;
+        case NoteSort::NEWEST:     strcpy(val, "Newest"); break;
+        case NoteSort::OLDEST:     strcpy(val, "Oldest"); break;
+        default:                   strcpy(val, "A-Z"); break;
       }
     } else if (i == 8) {
       int kbCount = getPairedKeyboardCount();

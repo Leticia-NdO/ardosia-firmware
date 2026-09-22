@@ -1,6 +1,7 @@
 #include "sleep_layout.h"
 
 #include <algorithm>
+#include <cstring>
 
 SleepPlacement sleepScreenFit(const int bitmapW, const int bitmapH,
                               const int screenW, const int screenH) {
@@ -20,54 +21,65 @@ SleepPlacement sleepScreenFit(const int bitmapW, const int bitmapH,
   return p;
 }
 
+namespace {
+
+uint16_t lastShown(const SleepRecent& recent) {
+  if (recent.fill == 0 || recent.pos >= SLEEP_RECENT_CAP) return 0;
+  const uint8_t slot =
+      static_cast<uint8_t>((recent.pos + SLEEP_RECENT_CAP - 1) % SLEEP_RECENT_CAP);
+  return recent.indices[slot];
+}
+
+}  // namespace
+
 int sleepScreenNextIndex(const SleepScreenMode mode, const int count,
-                         const bool haveHistory, const uint32_t last, const uint32_t roll) {
+                         const bool haveHistory, const SleepRecent& recent, const uint32_t roll) {
   if (count <= 1) return 0;
   const auto n = static_cast<uint32_t>(count);
 
-  if (mode == SleepScreenMode::SHUFFLE) {
-    uint32_t next = roll % n;
-    // Never the same wallpaper twice running — with three or four images a
-    // plain random pick repeats often enough to look broken.
-    if (haveHistory && next == last % n) next = (next + 1) % n;
-    return static_cast<int>(next);
+  if (mode != SleepScreenMode::SHUFFLE) {
+    if (!haveHistory || recent.fill == 0) return 0;
+    return static_cast<int>((lastShown(recent) + 1) % n);
   }
 
-  return static_cast<int>(haveHistory ? (last + 1) % n : 0);
+  // Same selection as CrossInk's ImageFolderIndex::chooseIndex: uniform among
+  // images outside the recent window. The window stops at count-1 so a folder
+  // of three still has one image that is not recent — otherwise, once the
+  // window covers the folder, the fallback random can repeat the last picture.
+  uint16_t blocked[SLEEP_RECENT_CAP];
+  int blockedCount = 0;
+  const int window = std::min({static_cast<int>(recent.fill), SLEEP_RECENT_CAP, count - 1});
+  if (haveHistory) {
+    for (int i = 0; i < window; i++) {
+      const uint8_t slot = static_cast<uint8_t>(
+          (recent.pos + SLEEP_RECENT_CAP - 1 - i) % SLEEP_RECENT_CAP);
+      const uint16_t index = recent.indices[slot];
+      if (index >= n) continue;
+      bool seen = false;
+      for (int j = 0; j < blockedCount; j++) {
+        if (blocked[j] == index) seen = true;
+      }
+      if (!seen) blocked[blockedCount++] = index;
+    }
+    std::sort(blocked, blocked + blockedCount);
+  }
+
+  const int freeCount = count - blockedCount;
+  uint16_t rank = static_cast<uint16_t>(freeCount > 0 ? roll % static_cast<uint32_t>(freeCount) : 0);
+  for (int i = 0; i < blockedCount; i++) {
+    if (blocked[i] <= rank) {
+      rank++;
+    } else {
+      break;
+    }
+  }
+  if (rank >= n) rank = static_cast<uint16_t>(n - 1);
+  return static_cast<int>(rank);
 }
 
-// Ordered 4x4 Bayer matrix, values 0..15. Ordered rather than error-diffused on
-// purpose: it needs no per-row state, so the draw loop stays a single pass over
-// the SD card with no buffers, and the regular texture survives the
-// nearest-neighbour scaling that drawing a wallpaper involves.
-static const uint8_t BAYER_4X4[16] = {
-     0,  8,  2, 10,
-    12,  4, 14,  6,
-     3, 11,  1,  9,
-    15,  7, 13,  5,
-};
-
-int sleepScreenLevelDensity(const uint8_t level, const SleepBrightness brightness) {
-  // Rows are levels 0..3 (black, dark, light, white); values are dot density
-  // out of 16. Level 3 is always 0 and level 0 always 16: brightening should
-  // lift the mid tones, not punch holes in the blacks or grey out the paper.
-  static const int DENSITY[3][4] = {
-      {16, 12, 8, 0},   // NORMAL
-      {16,  9, 4, 0},   // LIGHT
-      {16,  6, 2, 0},   // LIGHTER
-  };
-  const int row = static_cast<int>(brightness);
-  if (row < 0 || row > 2 || level > 3) return 0;
-  return DENSITY[row][level];
-}
-
-bool sleepScreenPixelIsBlack(const uint8_t level, const int x, const int y,
-                             const SleepBrightness brightness) {
-  const int density = sleepScreenLevelDensity(level, brightness);
-  if (density <= 0) return false;
-  if (density >= 16) return true;
-  // Negative coordinates never reach here, but keep the modulo well-defined.
-  const int bx = ((x % 4) + 4) % 4;
-  const int by = ((y % 4) + 4) % 4;
-  return BAYER_4X4[by * 4 + bx] < density;
+void sleepScreenRemember(SleepRecent& recent, const uint16_t index) {
+  if (recent.pos >= SLEEP_RECENT_CAP) recent.pos = 0;
+  recent.indices[recent.pos] = index;
+  recent.pos = static_cast<uint8_t>((recent.pos + 1) % SLEEP_RECENT_CAP);
+  if (recent.fill < SLEEP_RECENT_CAP) recent.fill++;
 }

@@ -41,7 +41,6 @@ static bool capsLockOn = false;
 // --- Keyboard layout (defined in main.cpp, persisted in NVS) ---
 extern KeyboardLayout keyboardLayout;
 extern SleepScreenMode sleepScreenMode;
-extern SleepBrightness sleepBrightness;
 
 // --- Last key seen, shown in the Settings footer -----------------------------
 // A BLE keyboard reports HID usage codes by physical POSITION, not by what is
@@ -76,6 +75,7 @@ extern UIState currentState;
 extern int mainMenuSelection;
 extern int selectedFileIndex;
 extern int settingsSelection;
+extern NoteSort noteSort;
 extern int bluetoothDeviceSelection;
 extern int pairedKeyboardSelection;
 extern Orientation currentOrientation;
@@ -312,10 +312,11 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
         saveCurrentFile();
       } else {
         // Updating title of a file selected in the browser
-        FileInfo* files = getFileList();
-        if (!updateFileTitle(files[selectedFileIndex].filename, renameBuffer)) {
+        FileInfo* note = noteVisibleAt(selectedFileIndex);
+        if (note == nullptr || !updateFileTitle(note->filename, renameBuffer)) {
           return;
         }
+        noteClampSelection(&selectedFileIndex);
       }
     }
     currentState = renameReturnState;
@@ -403,45 +404,61 @@ static void dispatchEvent(const KeyEvent& event) {
     }
 
     case UIState::FILE_BROWSER: {
-      int fc = getFileCount();
+      int fc = noteVisibleCount();
 
       // Delete confirmation pending — Enter confirms, anything else cancels
       if (deleteConfirmPending) {
         if (event.keyCode == HID_KEY_ENTER && fc > 0) {
-          FileInfo* files = getFileList();
-          deleteFile(files[selectedFileIndex].filename);
-          int newFc = getFileCount();
-          if (selectedFileIndex >= newFc) selectedFileIndex = newFc - 1;
-          if (selectedFileIndex < 0) selectedFileIndex = 0;
+          FileInfo* note = noteVisibleAt(selectedFileIndex);
+          if (note) deleteFile(note->filename);
+          noteClampSelection(&selectedFileIndex);
         }
         deleteConfirmPending = false;
         screenDirty = true;
         break;
       }
 
-      if (event.keyCode == HID_KEY_DOWN && fc > 0) {
+      if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_N) {
+        FileInfo* note = noteVisibleAt(selectedFileIndex);
+        if (note) openTitleEdit(note->title, UIState::FILE_BROWSER);
+      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_D) {
+        if (fc > 0) {
+          deleteConfirmPending = true;
+          screenDirty = true;
+        }
+      } else if (event.keyCode == HID_KEY_DOWN && fc > 0) {
         selectedFileIndex = (selectedFileIndex + 1) % fc;
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_UP && fc > 0) {
         selectedFileIndex = (selectedFileIndex - 1 + fc) % fc;
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_ENTER && fc > 0) {
-        FileInfo* files = getFileList();
-        loadFile(files[selectedFileIndex].filename);
+        FileInfo* note = noteVisibleAt(selectedFileIndex);
+        if (note) loadFile(note->filename);
         screenDirty = true;
-      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_N) {
-        if (fc > 0) {
-          FileInfo* files = getFileList();
-          openTitleEdit(files[selectedFileIndex].title, UIState::FILE_BROWSER);
-        }
-      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_D) {
-        if (fc > 0) {
-          deleteConfirmPending = true;
+      } else if (event.keyCode == HID_KEY_BACKSPACE) {
+        if (noteFilterText()[0] != '\0') {
+          noteFilterBackspace();
+          noteClampSelection(&selectedFileIndex);
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_ESCAPE) {
-        currentState = UIState::MAIN_MENU;
-        screenDirty = true;
+        if (noteFilterText()[0] != '\0') {
+          noteFilterClear();
+          selectedFileIndex = 0;
+          screenDirty = true;
+        } else {
+          currentState = UIState::MAIN_MENU;
+          screenDirty = true;
+        }
+      } else if (!isCtrl(event.modifiers)) {
+        uint32_t cps[2];
+        const int produced = inputResolveText(event.keyCode, event.modifiers, cps);
+        if (produced > 0) {
+          for (int i = 0; i < produced; i++) noteFilterPushCodepoint(cps[i]);
+          noteClampSelection(&selectedFileIndex);
+          screenDirty = true;
+        }
       }
       break;
     }
@@ -456,7 +473,7 @@ static void dispatchEvent(const KeyEvent& event) {
 
     case UIState::SETTINGS: {
       // Orientation, Dark Mode, Writing Mode, Font Size, Keyboard, Sleep Screen,
-      // Sleep Light, Bluetooth, Paired Keyboards
+      // Note Order, Bluetooth, Paired Keyboards
       const int SETTINGS_COUNT = 9;
 
       // Up/Down: navigate settings list (physical buttons also map here)
@@ -488,8 +505,7 @@ static void dispatchEvent(const KeyEvent& event) {
           sleepScreenMode = static_cast<SleepScreenMode>(
               (static_cast<int>(sleepScreenMode) + 1) % 3);
         } else if (settingsSelection == 6) {
-          sleepBrightness = static_cast<SleepBrightness>(
-              (static_cast<int>(sleepBrightness) + 1) % 3);
+          noteSort = static_cast<NoteSort>((static_cast<int>(noteSort) + 1) % 4);
         } else if (settingsSelection == 7) {
           currentState = UIState::BLUETOOTH_SETTINGS;
         } else if (settingsSelection == 8) {
@@ -519,8 +535,7 @@ static void dispatchEvent(const KeyEvent& event) {
           sleepScreenMode = static_cast<SleepScreenMode>(
               (static_cast<int>(sleepScreenMode) + 2) % 3);
         } else if (settingsSelection == 6) {
-          sleepBrightness = static_cast<SleepBrightness>(
-              (static_cast<int>(sleepBrightness) + 2) % 3);
+          noteSort = static_cast<NoteSort>((static_cast<int>(noteSort) + 3) % 4);
         }
         screenDirty = true;
 

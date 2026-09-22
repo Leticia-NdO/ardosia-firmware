@@ -16,38 +16,29 @@ struct SleepPlacement {
   int h;
 };
 
-// drawBitmap() scales an oversized image down to the screen but places it from
-// the top-left corner, so centring must be computed against the SCALED size,
-// not the file's. Images smaller than the screen are never scaled up.
+// Images larger than the screen are scaled down to fit and centred. Smaller
+// images are never scaled up — enlarging a 1-bit source on e-ink turns it
+// to mush.
 SleepPlacement sleepScreenFit(int bitmapW, int bitmapH, int screenW, int screenH);
 
-// ---------------------------------------------------------------------------
-// Tone mapping
-//
-// The panel is 1-bit: a pixel is black or white, there is no grey. Bitmap's
-// reader hands back 2 bits per pixel (0 black, 1 dark, 2 light, 3 white), and
-// GfxRenderer::drawBitmap() in BW mode collapses that by painting EVERYTHING
-// below pure white as solid black. Since the quantiser's top threshold is 140
-// of 255, any pixel dimmer than 55% brightness comes out black — which is why
-// wallpapers looked almost entirely dark.
-//
-// So the levels are rendered as HALFTONE instead: an ordered 4x4 Bayer pattern
-// whose dot density comes from the level. Mid tones become a stipple the eye
-// reads as grey, the way newsprint does, rather than a slab of black.
-// ---------------------------------------------------------------------------
+// How many recently shown indices the shuffle remembers. Same window CrossInk
+// keeps in CrossPointState::SLEEP_RECENT_COUNT.
+static constexpr int SLEEP_RECENT_CAP = 16;
 
-// Should this pixel be painted black?
-//   level  0..3 from Bitmap::readNextRow (0 = black ... 3 = white)
-//   x, y   SCREEN coordinates, so the pattern stays regular after scaling
-bool sleepScreenPixelIsBlack(uint8_t level, int x, int y, SleepBrightness brightness);
+// Circular buffer of recently shown image indices. pos is the next write
+// slot, fill is how many entries are valid (0..SLEEP_RECENT_CAP).
+struct SleepRecent {
+  uint16_t indices[SLEEP_RECENT_CAP];
+  uint8_t pos;
+  uint8_t fill;
+};
 
-// Dot density for a level, 0 (never black) to 16 (always black).
-// Exposed so the tests can state the tone curve directly.
-int sleepScreenLevelDensity(uint8_t level, SleepBrightness brightness);
+// Slideshow: next in order, wrapping. Cold boot (no history) starts at 0.
+// Shuffle: uniform among images that are not in the recent window, so a
+// folder is walked before anything repeats. The window is capped at count-1
+// so a small folder still has somewhere to go. `roll` is the random draw,
+// passed in so the host tests stay deterministic.
+int sleepScreenNextIndex(SleepScreenMode mode, int count, bool haveHistory,
+                         const SleepRecent& recent, uint32_t roll);
 
-// Which wallpaper this sleep shows.
-//   haveHistory  false on a cold boot, when the RTC counter is not valid
-//   last         the index shown last time
-//   roll         a random draw, passed in so this stays deterministic in tests
-int sleepScreenNextIndex(SleepScreenMode mode, int count,
-                         bool haveHistory, uint32_t last, uint32_t roll);
+void sleepScreenRemember(SleepRecent& recent, uint16_t index);

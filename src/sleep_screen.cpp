@@ -10,50 +10,35 @@
 #include <esp_random.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 
-// ---------------------------------------------------------------------------
-// Custom sleep screens.
+// Custom sleep screens, following CrossInk's SleepActivity for the two parts
+// that were visibly wrong here:
 //
-// Modelled on crosspoint-reader's SleepActivity (MIT), which this firmware
-// already shares its Bitmap/GfxRenderer code with — lib/GfxRenderer here is the
-// same vendored source. Kept deliberately smaller: crosspoint also does PNG,
-// alpha overlays, book covers and quick-resume, none of which a writing device
-// needs.
-//
-// Wallpapers are BMPs. Locations, in the order they are tried:
-//   /sleep/      a directory of images  (the slideshow)
-//   /.sleep/     same, hidden — crosspoint's own path, so an SD card set up for
-//                a CrossPoint device works here unchanged
-//   /sleep.bmp   a single image
-// ---------------------------------------------------------------------------
+//   * which image — a recent-window shuffle (CrossPointState's 16-deep ring),
+//     not "random, and if it hit the last one, take the next". Names are
+//     sorted so an index means the same file from sleep to sleep.
+//   * how it is drawn — Atkinson error diffusion on the fitted size, then the
+//     panel's 4-level grayscale, same as renderBitmapSleepScreen. Ordered
+//     Bayer on top of a nearest-neighbour scale turned photos into newsprint.
 
 namespace {
 
 const char* const SLEEP_DIRS[] = {"/sleep", "/.sleep"};
 constexpr char SLEEP_SINGLE_FILE[] = "/sleep.bmp";
-
-// Where the slideshow is. RTC memory, not NVS: it survives deep sleep (which is
-// the only transition that matters here) and costs no flash wear, and flash
-// wear on a per-sleep path is exactly the debt this repo has already paid once.
-//
-// It does NOT survive a cold power-on, and the magic guards against reading
-// garbage on the first boot after a flash. Degraded behaviour is "the slideshow
-// restarts at the first image", which is visible and harmless.
-constexpr uint32_t SLEEP_RTC_MAGIC = 0x534C5031;  // "SLP1"
-RTC_DATA_ATTR uint32_t rtcMagic = 0;
-RTC_DATA_ATTR uint32_t rtcLastIndex = 0;
-
+constexpr int MAX_SLEEP_IMAGES = 64;
 constexpr size_t MAX_SLEEP_NAME = 64;
+
+constexpr uint32_t SLEEP_RTC_MAGIC = 0x534C5032;  // "SLP2" — layout of the ring changed
+RTC_DATA_ATTR uint32_t rtcMagic = 0;
+RTC_DATA_ATTR SleepRecent rtcRecent = {};
 
 bool hasBmpExtension(const char* name) {
   const size_t n = strlen(name);
   return n > 4 && strcasecmp(name + n - 4, ".bmp") == 0;
 }
 
-// A file counts only if its BMP header actually parses. Validating up front is
-// what stops a truncated or non-BMP file from producing a blank sleep screen
-// with no way to tell why.
 bool isDrawableBmp(FsFile& file) {
   Bitmap probe(file);
   const bool ok = probe.parseHeaders() == BmpReaderError::Ok;
@@ -61,154 +46,111 @@ bool isDrawableBmp(FsFile& file) {
   return ok;
 }
 
-// Walk `dir` to the next drawable BMP and copy its name into `name`.
-//
-// Returns the NAME, not the open file: FsFile is neither copyable nor movable
-// out of here, and the caller wants a path it can reopen anyway.
-bool nextDrawableName(FsFile& dir, char* name, const size_t nameLen) {
-  for (auto file = dir.openNextFile(); file; file = dir.openNextFile()) {
-    if (file.isDirectory()) { file.close(); continue; }
-    file.getName(name, nameLen);
-    const bool candidate = name[0] != '\0' && name[0] != '.' && hasBmpExtension(name);
-    const bool drawable = candidate && isDrawableBmp(file);
-    file.close();
-    if (drawable) return true;
-  }
-  return false;
+int cmpName(const void* a, const void* b) {
+  return strcasecmp(static_cast<const char*>(a), static_cast<const char*>(b));
 }
 
-// Two passes over the directory instead of building a list of names: the file
-// count is unbounded and this chip has 320KB of RAM in total.
-int countDrawable(const char* dirPath) {
+// Sorted list of drawable BMP names. A fixed cap keeps this off a growing
+// vector; a personal sleep folder is nowhere near 64 images.
+int listDrawable(const char* dirPath, char names[][MAX_SLEEP_NAME], const int cap) {
   auto dir = SdMan.open(dirPath);
-  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return 0; }
+  if (!dir || !dir.isDirectory()) {
+    if (dir) dir.close();
+    return 0;
+  }
 
-  char name[MAX_SLEEP_NAME];
   int count = 0;
   dir.rewindDirectory();
-  while (nextDrawableName(dir, name, sizeof(name))) {
-    if (++count >= 1000) break;   // sanity ceiling
+  for (auto file = dir.openNextFile(); file && count < cap; file = dir.openNextFile()) {
+    if (file.isDirectory()) {
+      file.close();
+      continue;
+    }
+    file.getName(names[count], MAX_SLEEP_NAME);
+    const bool candidate = names[count][0] != '\0' && names[count][0] != '.' && hasBmpExtension(names[count]);
+    const bool drawable = candidate && isDrawableBmp(file);
+    file.close();
+    if (drawable) count++;
   }
   dir.close();
+  if (count > 1) qsort(names, static_cast<size_t>(count), MAX_SLEEP_NAME, cmpName);
   return count;
 }
 
-// Build "<dirPath>/<name of the index-th drawable BMP>" into `outPath`.
-bool pathOfDrawableAt(const char* dirPath, const int index, char* outPath, const size_t outLen) {
-  auto dir = SdMan.open(dirPath);
-  if (!dir || !dir.isDirectory()) { if (dir) dir.close(); return false; }
-
-  char name[MAX_SLEEP_NAME];
-  dir.rewindDirectory();
-  for (int i = 0; i <= index; i++) {
-    if (!nextDrawableName(dir, name, sizeof(name))) { dir.close(); return false; }
-  }
-  dir.close();
-  snprintf(outPath, outLen, "%s/%s", dirPath, name);
-  return true;
-}
-
-// Pick which image this sleep shows, and remember it for the next one.
-// The decision itself lives in sleep_layout.cpp so it can be tested on a host;
-// this wrapper only owns the RTC state around it.
 int chooseIndex(const SleepScreenMode mode, const int count) {
   const bool haveHistory = (rtcMagic == SLEEP_RTC_MAGIC);
-  const int next = sleepScreenNextIndex(mode, count, haveHistory, rtcLastIndex, esp_random());
-  rtcLastIndex = static_cast<uint32_t>(next);
+  const int next = sleepScreenNextIndex(mode, count, haveHistory, rtcRecent, esp_random());
+  sleepScreenRemember(rtcRecent, static_cast<uint16_t>(next));
   rtcMagic = SLEEP_RTC_MAGIC;
   return next;
 }
 
-// Draw the wallpaper, halftoned.
-//
-// This does NOT use GfxRenderer::drawBitmap(). That function is fine for icons
-// but in BW mode it paints every level below pure white as solid black, and the
-// quantiser's white threshold is 140 of 255 — so a photograph comes out as a
-// slab of black. See sleep_layout.h.
-//
-// Instead the 2-bit rows come straight from Bitmap::readNextRow() (public API,
-// no change to the vendored library) and each level is rendered as a dot
-// density. One pass over the file, two small row buffers, no frame of state.
-bool drawHalftoned(GfxRenderer& renderer, const Bitmap& bitmap, const SleepBrightness brightness) {
+// Photos go through the 4-level grayscale waveform. 1-bit art stays a single
+// black-and-white refresh so a crisp drawing is not softened.
+bool presentBitmap(GfxRenderer& renderer, Bitmap& bitmap) {
   const int screenW = renderer.getScreenWidth();
   const int screenH = renderer.getScreenHeight();
   const SleepPlacement place = sleepScreenFit(bitmap.getWidth(), bitmap.getHeight(), screenW, screenH);
   if (place.w <= 0 || place.h <= 0) return false;
 
-  const int srcW = bitmap.getWidth();
-  const int srcH = bitmap.getHeight();
-  const float scale = static_cast<float>(place.w) / static_cast<float>(srcW);
-
-  const int outputRowSize = (srcW + 3) / 4;
-  auto* outputRow = static_cast<uint8_t*>(malloc(static_cast<size_t>(outputRowSize)));
-  auto* rowBytes = static_cast<uint8_t*>(malloc(static_cast<size_t>(bitmap.getRowBytes())));
-  if (!outputRow || !rowBytes) {
-    free(outputRow);
-    free(rowBytes);
-    return false;
+  if (bitmap.getWidth() > place.w || bitmap.getHeight() > place.h) {
+    bitmap.setDitheredOutputSize(place.w, place.h);
   }
 
-  bool ok = true;
-  int prevScreenY = INT32_MIN;
-  for (int srcY = 0; srcY < srcH; srcY++) {
-    // Every row has to be read, in order, even when it will not be drawn:
-    // readNextRow() walks the file sequentially and skipping a call would
-    // desynchronise every row after it.
-    if (bitmap.readNextRow(outputRow, rowBytes) != BmpReaderError::Ok) {
-      // A short read ends the draw rather than skipping ahead; whatever is
-      // already on screen still shows.
-      ok = (srcY > 0);
-      break;
-    }
+  renderer.clearScreen();
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.drawBitmap(bitmap, place.x, place.y, screenW, screenH);
 
-    // A BMP is stored bottom-up unless its height is negative.
-    const int imageY = bitmap.isTopDown() ? srcY : (srcH - 1 - srcY);
-    const int screenY = place.y + static_cast<int>(static_cast<float>(imageY) * scale);
-    if (screenY < 0 || screenY >= screenH) continue;
-
-    // Scaling down maps several source rows onto one screen row. Drawing all of
-    // them is pure waste, and on an 80MHz core a 12-megapixel wallpaper would
-    // make "hold power to sleep" take visibly long.
-    if (screenY == prevScreenY) continue;
-    prevScreenY = screenY;
-
-    int prevScreenX = INT32_MIN;
-    for (int srcX = 0; srcX < srcW; srcX++) {
-      const int screenX = place.x + static_cast<int>(static_cast<float>(srcX) * scale);
-      if (screenX < 0 || screenX >= screenW) continue;
-      if (screenX == prevScreenX) continue;   // same reason, along the row
-      prevScreenX = screenX;
-
-      // Two bits per pixel, packed high-to-low within each byte.
-      const uint8_t level = (outputRow[srcX / 4] >> (6 - ((srcX * 2) % 8))) & 0x3;
-
-      // Paint white explicitly as well as black: when scaling down, several
-      // source pixels land on one screen pixel, and only painting the black
-      // ones would let any dark pixel in the group win and darken the image.
-      renderer.drawPixel(screenX, screenY,
-                         sleepScreenPixelIsBlack(level, screenX, screenY, brightness));
-    }
+  if (!bitmap.hasGreyscale()) {
+    renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+    return true;
   }
 
-  free(outputRow);
-  free(rowBytes);
-  return ok;
+  // The grayscale LUT is a fast differential update. Without a real base
+  // refresh first it just fades whatever is already on the glass — the
+  // screen looks frozen and washed out, and the wallpaper never appears.
+  // CrossInk does this with displayGrayscaleBase(HALF_REFRESH).
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+
+  for (const auto mode : {GfxRenderer::GRAYSCALE_LSB, GfxRenderer::GRAYSCALE_MSB}) {
+    if (bitmap.rewindToData() != BmpReaderError::Ok) {
+      renderer.setRenderMode(GfxRenderer::BW);
+      return false;
+    }
+    // Gray planes are white marks on a black field. clearScreen() leaves
+    // 0xFF, and drawing white onto white would store an empty plane.
+    renderer.clearScreen(0x00);
+    renderer.setRenderMode(mode);
+    renderer.drawBitmap(bitmap, place.x, place.y, screenW, screenH);
+    if (mode == GfxRenderer::GRAYSCALE_LSB) {
+      renderer.copyGrayscaleLsbBuffers();
+    } else {
+      renderer.copyGrayscaleMsbBuffers();
+    }
+  }
+  renderer.setRenderMode(GfxRenderer::BW);
+  renderer.displayGrayBuffer();
+  return true;
 }
 
 }  // namespace
 
-bool sleepScreenDrawImage(GfxRenderer& renderer, const SleepScreenMode mode,
-                          const SleepBrightness brightness) {
+bool sleepScreenDrawImage(GfxRenderer& renderer, const SleepScreenMode mode) {
   if (mode == SleepScreenMode::TEXT) return false;
 
   char path[MAX_SLEEP_NAME + 16];
   path[0] = '\0';
 
-  for (const char* candidate : SLEEP_DIRS) {
-    const int count = countDrawable(candidate);
-    if (count <= 0) continue;
-    if (pathOfDrawableAt(candidate, chooseIndex(mode, count), path, sizeof(path))) break;
-    path[0] = '\0';
+  auto* names = static_cast<char(*)[MAX_SLEEP_NAME]>(malloc(MAX_SLEEP_IMAGES * MAX_SLEEP_NAME));
+  if (names) {
+    for (const char* candidate : SLEEP_DIRS) {
+      const int count = listDrawable(candidate, names, MAX_SLEEP_IMAGES);
+      if (count <= 0) continue;
+      const int index = chooseIndex(mode, count);
+      snprintf(path, sizeof(path), "%s/%s", candidate, names[index]);
+      break;
+    }
+    free(names);
   }
 
   if (path[0] == '\0') {
@@ -219,16 +161,15 @@ bool sleepScreenDrawImage(GfxRenderer& renderer, const SleepScreenMode mode,
   auto file = SdMan.open(path);
   if (!file) return false;
 
-  // dithering=false: the halftone is ours (sleep_layout.cpp). The library's own
-  // ditherer quantises to four levels, which BW rendering would collapse again.
-  Bitmap bitmap(file);
+  // imageLevels: the grayscale LUT wants even 0/85/170/255 steps, which is
+  // what CrossInk uses when the panel can show the four levels.
+  Bitmap bitmap(file, true, true);
   if (bitmap.parseHeaders() != BmpReaderError::Ok) {
     file.close();
     return false;
   }
 
-  renderer.clearScreen();
-  const bool drawn = drawHalftoned(renderer, bitmap, brightness);
+  const bool drawn = presentBitmap(renderer, bitmap);
   file.close();
   SdMan.sleep();
   return drawn;

@@ -96,7 +96,9 @@ class Atkinson1BitDitherer {
 // Less error buildup = fewer artifacts than Floyd-Steinberg
 class AtkinsonDitherer {
  public:
-  explicit AtkinsonDitherer(int width) : width(width) {
+  // imageLevels: even 0/85/170/255 steps for a 4-level grayscale panel.
+  // Otherwise the thresholds are the ones tuned for the X4 waveform.
+  explicit AtkinsonDitherer(int width, bool imageLevels = false) : imageLevels(imageLevels), width(width) {
     errorRow0 = new int16_t[width + 4]();  // Current row
     errorRow1 = new int16_t[width + 4]();  // Next row
     errorRow2 = new int16_t[width + 4]();  // Row after next
@@ -122,7 +124,7 @@ class AtkinsonDitherer {
     // Quantize to 4 levels
     uint8_t quantized;
     int quantizedValue;
-    if (false) {  // original thresholds
+    if (imageLevels) {
       if (adjusted < 43) {
         quantized = 0;
         quantizedValue = 0;
@@ -181,6 +183,7 @@ class AtkinsonDitherer {
   }
 
  private:
+  bool imageLevels;
   int width;
   int16_t* errorRow0;
   int16_t* errorRow1;

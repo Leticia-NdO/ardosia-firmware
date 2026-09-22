@@ -45,6 +45,7 @@ enum class SleepReason {
 };
 
 // Forward declarations
+void drawStatusPopup(const char* msg);
 void renderSleepScreen();
 void enterDeepSleep(SleepReason reason);
 
@@ -85,6 +86,7 @@ UIState currentState = UIState::MAIN_MENU;
 int mainMenuSelection = 0;
 int selectedFileIndex = 0;
 int settingsSelection = 0;
+NoteSort noteSort = NoteSort::ALPHA_ASC;
 int bluetoothDeviceSelection = 0;
 int pairedKeyboardSelection = 0;
 Orientation currentOrientation = Orientation::PORTRAIT;
@@ -283,6 +285,8 @@ void setup() {
   if (static_cast<int>(sleepScreenMode) > 2) sleepScreenMode = SleepScreenMode::TEXT;
   sleepBrightness = static_cast<SleepBrightness>(uiPrefs.getUChar("sleepLight", 0));
   if (static_cast<int>(sleepBrightness) > 2) sleepBrightness = SleepBrightness::NORMAL;
+  noteSort = static_cast<NoteSort>(uiPrefs.getUChar("noteSort", 0));
+  if (static_cast<int>(noteSort) > 3) noteSort = NoteSort::ALPHA_ASC;
 
   // Apply saved orientation
   {
@@ -296,6 +300,10 @@ void setup() {
     renderer.setOrientation(gfxOrient);
   }
 
+  // First thing the panel can show. BLE and the SD mount are the slow part
+  // of wake; without this the glass stays on the sleep image until the menu.
+  drawStatusPopup("Waking up...");
+
   editorInit();
   inputSetup();
   fileManagerSetup();
@@ -306,7 +314,7 @@ void setup() {
 
   // Restore UI prefs from SD backup if NVS was wiped by a firmware flash
   if (!uiPrefs.isKey("orient")) {
-    static char uiBuf[128];
+    static char uiBuf[256];
     if (sdReadFile("/ardosia/ui_prefs.json", uiBuf, sizeof(uiBuf))) {
       int o  = jsonGetInt(uiBuf, "orient");
       int d  = jsonGetInt(uiBuf, "dark");
@@ -316,6 +324,7 @@ void setup() {
       int kb = jsonGetInt(uiBuf, "kbLayout");
       int ss = jsonGetInt(uiBuf, "sleepScr");
       int sl = jsonGetInt(uiBuf, "sleepLight");
+      int ns = jsonGetInt(uiBuf, "noteSort");
       if (o  >= 0) { uiPrefs.putUChar("orient",    (uint8_t)o);  currentOrientation = static_cast<Orientation>(o); }
       if (d  >= 0) { uiPrefs.putBool("darkMode",   d != 0);      darkMode           = (d != 0); }
       if (wm >= 0) { uiPrefs.putUChar("writeMode", (uint8_t)wm); writingMode        = static_cast<WritingMode>(wm); }
@@ -324,6 +333,10 @@ void setup() {
       if (kb >= 0) { uiPrefs.putUChar("kbLayout",  (uint8_t)kb); keyboardLayout     = static_cast<KeyboardLayout>(kb); }
       if (ss >= 0) { uiPrefs.putUChar("sleepScr",  (uint8_t)ss); sleepScreenMode    = static_cast<SleepScreenMode>(ss); }
       if (sl >= 0) { uiPrefs.putUChar("sleepLight",(uint8_t)sl); sleepBrightness    = static_cast<SleepBrightness>(sl); }
+      if (ns >= 0 && ns <= 3) {
+        uiPrefs.putUChar("noteSort", (uint8_t)ns);
+        noteSort = static_cast<NoteSort>(ns);
+      }
       // Re-apply orientation in case it changed
       GfxRenderer::Orientation gfxOrient = GfxRenderer::Portrait;
       switch (currentOrientation) {
@@ -697,9 +710,37 @@ void registerActivity() {
 // there is no card, no /sleep folder, or nothing in it that parses as a BMP.
 // On a device with no USB recovery, "asleep showing nothing" is a state worth
 // never creating.
+// Centered status card. HALF_REFRESH so it actually replaces the sleep
+// wallpaper (a fast differential update ghosts the previous frame).
+void drawStatusPopup(const char* msg) {
+  renderer.clearScreen();
+  const int sw = renderer.getScreenWidth();
+  const int sh = renderer.getScreenHeight();
+  const int tw = renderer.getTextAdvanceX(FONT_BODY, msg);
+  const int th = renderer.getLineHeight(FONT_BODY);
+  const int w = tw + 48;
+  const int h = th + 28;
+  const int x = (sw - w) / 2;
+  const int y = sh / 2 - h / 2;
+  renderer.fillRect(x - 3, y - 3, w + 6, h + 6, true);
+  renderer.fillRect(x, y, w, h, false);
+  renderer.drawText(FONT_BODY, x + 24, y + 8, msg, true, EpdFontFamily::BOLD);
+  renderer.displayBuffer(HalDisplay::HALF_REFRESH);
+}
+
 void renderSleepScreen() {
-  if (sleepScreenDrawImage(renderer, sleepScreenMode, sleepBrightness)) {
-    renderer.displayBuffer(HalDisplay::FULL_REFRESH);
+  // The reading UI may be landscape, but the sleep image stays portrait:
+  // logical 480×800, which the renderer rotates onto the panel. Restored
+  // before we return so "Waking up..." follows the saved orientation.
+  const auto savedOrientation = renderer.getOrientation();
+  renderer.setOrientation(GfxRenderer::Portrait);
+
+  // Shown before the SD read and the dither, which are the slow part.
+  // Same role as CrossInk's "Going to sleep..." popup.
+  drawStatusPopup("Going to sleep...");
+
+  if (sleepScreenDrawImage(renderer, sleepScreenMode)) {
+    renderer.setOrientation(savedOrientation);
     delay(500);
     return;
   }
@@ -732,7 +773,8 @@ void renderSleepScreen() {
 
   // Perform a full display refresh to ensure the sleep screen is visible
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
-  
+  renderer.setOrientation(savedOrientation);
+
   // Small delay to ensure the display update is complete
   delay(500);
 }
@@ -822,12 +864,14 @@ void loop() {
   static KeyboardLayout lastSavedKeyboardLayout = keyboardLayout;
   static SleepScreenMode lastSavedSleepScreen = sleepScreenMode;
   static SleepBrightness lastSavedSleepBrightness = sleepBrightness;
+  static NoteSort lastSavedNoteSort = noteSort;
   if (currentOrientation != lastSavedOrientation || darkMode != lastSavedDarkMode
       || writingMode != lastSavedWritingMode || fontSize != lastSavedFontSize
       || showWordCount != lastSavedShowWordCount
       || keyboardLayout != lastSavedKeyboardLayout
       || sleepScreenMode != lastSavedSleepScreen
-      || sleepBrightness != lastSavedSleepBrightness) {
+      || sleepBrightness != lastSavedSleepBrightness
+      || noteSort != lastSavedNoteSort) {
     uiPrefs.putUChar("orient", static_cast<uint8_t>(currentOrientation));
     uiPrefs.putBool("darkMode", darkMode);
     uiPrefs.putUChar("writeMode", static_cast<uint8_t>(writingMode));
@@ -836,6 +880,7 @@ void loop() {
     uiPrefs.putUChar("kbLayout", static_cast<uint8_t>(keyboardLayout));
     uiPrefs.putUChar("sleepScr", static_cast<uint8_t>(sleepScreenMode));
     uiPrefs.putUChar("sleepLight", static_cast<uint8_t>(sleepBrightness));
+    uiPrefs.putUChar("noteSort", static_cast<uint8_t>(noteSort));
     lastSavedOrientation = currentOrientation;
     lastSavedDarkMode = darkMode;
     lastSavedWritingMode = writingMode;
@@ -844,14 +889,17 @@ void loop() {
     lastSavedKeyboardLayout = keyboardLayout;
     lastSavedSleepScreen = sleepScreenMode;
     lastSavedSleepBrightness = sleepBrightness;
+    lastSavedNoteSort = noteSort;
     // Keep SD backup in sync so settings survive a firmware flash
-    static char uiBuf[200];
+    static char uiBuf[256];
     snprintf(uiBuf, sizeof(uiBuf),
              "{\"orient\":%d,\"dark\":%d,\"writeMode\":%d,\"fontSize\":%d,"
-             "\"showWC\":%d,\"kbLayout\":%d,\"sleepScr\":%d,\"sleepLight\":%d}",
+             "\"showWC\":%d,\"kbLayout\":%d,\"sleepScr\":%d,\"sleepLight\":%d,"
+             "\"noteSort\":%d}",
              (int)currentOrientation, darkMode ? 1 : 0,
              (int)writingMode, (int)fontSize, showWordCount ? 1 : 0,
-             (int)keyboardLayout, (int)sleepScreenMode, (int)sleepBrightness);
+             (int)keyboardLayout, (int)sleepScreenMode, (int)sleepBrightness,
+             (int)noteSort);
     sdEnsureBackupDir();
     sdWriteFile("/ardosia/ui_prefs.json", uiBuf);
   }

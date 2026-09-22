@@ -127,6 +127,16 @@ enum class SleepBrightness : uint8_t { NORMAL = 0, LIGHT = 1, LIGHTER = 2 };
 // --- Font Size ---
 enum class FontSize : uint8_t { SMALL = 0, MEDIUM = 1, LARGE = 2 };
 
+// How the notes list is ordered. Creation is a counter we assign, not the
+// FAT timestamp: this board has no wall clock, so device-created files
+// would all share the 1980 epoch and sort as a tie.
+enum class NoteSort : uint8_t {
+  ALPHA_ASC = 0,
+  ALPHA_DESC = 1,
+  NEWEST = 2,
+  OLDEST = 3
+};
+
 inline int editorFontId(FontSize size) {
   switch (size) {
     case FontSize::SMALL:  return FONT_UI;    // notosans 12
