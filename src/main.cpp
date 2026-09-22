@@ -446,11 +446,18 @@ static void processPhysicalButtons() {
         && duration < POWER_SLEEP_HOLD_MS) {
       // Short press - go to main menu (except when already there)
       if (currentState != UIState::MAIN_MENU) {
-        if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
-          saveCurrentFile();
+        if (currentState == UIState::WIFI_SYNC) {
+          // Leaving WIFI_SYNC without this left syncActive true, the radio
+          // up, and deep sleep suppressed forever. With the AP holding
+          // ESP_PM_APB_FREQ_MAX the device would not light-sleep at all.
+          wifiSyncStop();
+        } else {
+          if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
+            saveCurrentFile();
+          }
+          currentState = UIState::MAIN_MENU;
+          screenDirty = true;
         }
-        currentState = UIState::MAIN_MENU;
-        screenDirty = true;
       }
     }
   }
@@ -470,6 +477,9 @@ static void processPhysicalButtons() {
     if (millis() - backPressStart > 5000) {
       restartTriggered = true;
       DBG_PRINTLN("BACK held for 5s — restarting device...");
+      if (currentState == UIState::WIFI_SYNC) {
+        wifiSyncStop();
+      }
       if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
         saveCurrentFile();
       }
@@ -783,12 +793,13 @@ void loop() {
     }
   }
 
-  // Periodically refresh sync screen to show status changes (every 2s)
+  // Refresh the sync/hotspot screen only when a counter actually moved.
+  // A multi-minute AP session used to force a FAST_REFRESH every 2 s.
   if (currentState == UIState::WIFI_SYNC) {
     static unsigned long lastSyncRefresh = 0;
     if (millis() - lastSyncRefresh > 2000) {
-      screenDirty = true;
       lastSyncRefresh = millis();
+      if (wifiSyncUiChanged()) screenDirty = true;
     }
   }
 

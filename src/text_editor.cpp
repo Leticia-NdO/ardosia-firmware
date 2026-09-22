@@ -12,6 +12,7 @@ static int cursorPosition = 0;
 static char currentFile[MAX_FILENAME_LEN] = "";
 static char currentTitle[MAX_TITLE_LEN] = "Untitled";
 static bool unsavedChanges = false;
+static bool readOnly = false;
 
 // --- Line management ---
 static int linePositions[MAX_LINES];  // Index into textBuffer for start of each line
@@ -117,6 +118,7 @@ void editorInit() {
   currentFile[0] = '\0';
   strncpy(currentTitle, "Untitled", MAX_TITLE_LEN - 1);
   unsavedChanges = false;
+  readOnly = false;
   viewportStartLine = 0;
   lineBreaksDirty = true;
   editorRecalculateLines();
@@ -127,6 +129,7 @@ void editorClear() {
   textLength = 0;
   cursorPosition = 0;
   unsavedChanges = false;
+  readOnly = false;
   viewportStartLine = 0;
   lineBreaksDirty = true;
   editorRecalculateLines();
@@ -165,6 +168,7 @@ int editorGetWordCount() {
 // single byte cannot express "á" (0xC3 0xA1) — the buffer stays UTF-8 bytes,
 // but a character is inserted and removed as one unit.
 void editorInsertCodepoint(uint32_t cp) {
+  if (readOnly) return;
   char enc[4];
   const int n = utf8Encode(cp, enc);
   if (n <= 0) return;
@@ -185,6 +189,7 @@ void editorInsertCodepoint(uint32_t cp) {
 }
 
 void editorDeleteChar() {
+  if (readOnly) return;
   if (cursorPosition <= 0 || textLength == 0) return;
 
   // Remove the whole character, not one byte: deleting half of "á" would leave
@@ -205,6 +210,7 @@ void editorDeleteChar() {
 }
 
 void editorDeleteForward() {
+  if (readOnly) return;
   if (cursorPosition >= (int)textLength) return;
 
   const size_t end = utf8NextStart(textBuffer, textLength, (size_t)cursorPosition);
@@ -339,3 +345,6 @@ const char* editorGetCurrentFile() { return currentFile; }
 const char* editorGetCurrentTitle() { return currentTitle; }
 bool editorHasUnsavedChanges() { return unsavedChanges; }
 void editorSetUnsavedChanges(bool v) { unsavedChanges = v; }
+
+bool editorIsReadOnly() { return readOnly; }
+void editorSetReadOnly(bool v) { readOnly = v; }

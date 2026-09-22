@@ -270,14 +270,23 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   renderer.drawCenteredText(FONT_BODY, 30, "Ardosia", tc, EpdFontFamily::BOLD);
 
   // Menu items (base + dynamically detected OTA apps)
-  static const char* baseMenuItems[] = {"Browse Files", "New Note", "Settings", "Sync"};
-  int menuCount = 4 + otaAppCount;
+  static const char* baseMenuItems[] = {
+      "Browse Files", "New Note", "Settings", "Sync", "Sync (Hotspot)"};
+  int menuCount = BASE_MENU_COUNT + otaAppCount;
   const int bandH = bandHeight(FONT_UI);
   const int pitch = rowPitch(FONT_UI);
+  const int ruleY = footerRuleY(renderer, 2);
+  int listTop = 85;
+  const int needed = menuCount * pitch;
+  if (listTop + needed > ruleY - 4) {
+    listTop = ruleY - 4 - needed;
+    if (listTop < 40) listTop = 40;
+  }
   for (int i = 0; i < menuCount; i++) {
-    int bandTop = 85 + (i * pitch);
+    int bandTop = listTop + (i * pitch);
     int textY = textYInBand(FONT_UI, bandTop, bandH);
-    const char* label = (i < 4) ? baseMenuItems[i] : otaApps[i - 4].name;
+    const char* label = (i < BASE_MENU_COUNT) ? baseMenuItems[i]
+                                              : otaApps[i - BASE_MENU_COUNT].name;
     if (i == mainMenuSelection) {
       clippedFillRect(renderer, 5, bandTop, sw - 10, bandH, tc);
       drawClippedText(renderer, FONT_UI, 20, textY, label, sw - 40, !tc);
@@ -287,7 +296,6 @@ void drawMainMenu(GfxRenderer& renderer, HalGPIO& gpio) {
   }
 
   // Footer
-  const int ruleY = footerRuleY(renderer, 2);
   if (ruleY > 120) {
     clippedLine(renderer, 10, ruleY, sw - 10, ruleY, tc);
     drawClippedText(renderer, FONT_SMALL, 20, footerLineY(ruleY, 0),
@@ -439,7 +447,10 @@ static int drawEditorHeader(GfxRenderer& renderer, HalGPIO& gpio, int sw, bool t
 
   const char* title = editorGetCurrentTitle();
   char headerBuf[64];
-  if (editorHasUnsavedChanges()) {
+  if (editorIsReadOnly()) {
+    // Prefix so the warning stays visible when the title is long and clipped.
+    snprintf(headerBuf, sizeof(headerBuf), "[read-only] %s", title);
+  } else if (editorHasUnsavedChanges()) {
     snprintf(headerBuf, sizeof(headerBuf), "%s *", title);
   } else {
     strncpy(headerBuf, title, sizeof(headerBuf) - 1);
@@ -990,12 +1001,14 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
 
   if (darkMode) clippedFillRect(renderer, 0, 0, sw, sh, true);
 
+  SyncState state = getSyncState();
+
   // Header
-  drawClippedText(renderer, FONT_SMALL, 10, 5, "Sync", 0, tc, EpdFontFamily::BOLD);
+  drawClippedText(renderer, FONT_SMALL, 10, 5,
+                  state == SyncState::AP_ACTIVE ? "Hotspot" : "Sync",
+                  0, tc, EpdFontFamily::BOLD);
   drawBattery(renderer, gpio);
   clippedLine(renderer, 5, 32, sw - 5, 32, tc);
-
-  SyncState state = getSyncState();
 
   switch (state) {
     case SyncState::SCANNING: {
@@ -1094,6 +1107,34 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       const char* st = getSyncStatusText();
       drawClippedText(renderer, FONT_UI, 20, 80, st, sw - 40, tc);
       drawClippedText(renderer, FONT_SMALL, 20, 80 + lineStep(FONT_UI), "Esc: Cancel", 0, tc);
+      break;
+    }
+
+    case SyncState::AP_ACTIVE: {
+      // Clone of SYNCING's helper-based layout, not DONE/SAVE_PROMPT:
+      // those use fixed y and clip on the bottom (see CLAUDE.md).
+      const int ruleY = footerRuleY(renderer, 1);
+      const int step = lineStep(FONT_SMALL);
+      int y = 42;
+      char line[64];
+      auto drawLine = [&](const char* text) {
+        drawClippedText(renderer, FONT_SMALL, 20, y, text, sw - 40, tc);
+        y += step;
+      };
+      snprintf(line, sizeof(line), "SSID: %s", getApSsid());
+      drawLine(line);
+      snprintf(line, sizeof(line), "Pass: %s", getApPassword());
+      drawLine(line);
+      snprintf(line, sizeof(line), "IP: %s", getSyncStatusText());
+      drawLine(line);
+      snprintf(line, sizeof(line), "Clients: %d", getApStationCount());
+      drawLine(line);
+      snprintf(line, sizeof(line), "Received: %d", getSyncFilesReceived());
+      drawLine(line);
+
+      clippedLine(renderer, 10, ruleY, sw - 10, ruleY, tc);
+      drawClippedText(renderer, FONT_SMALL, 10, footerLineY(ruleY, 0),
+                      "Esc: Stop", 0, tc);
       break;
     }
 

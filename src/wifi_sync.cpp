@@ -2,6 +2,7 @@
 #include "config.h"
 #include "file_manager.h"
 #include "sd_backup.h"
+#include "utf8_util.h"
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -64,6 +65,31 @@ static bool pcConnected = false;
 static unsigned long lastHttpActivityMs = 0;
 static constexpr unsigned long SYNC_TIMEOUT_MS = 60000;  // 60s no HTTP → auto-disconnect
 static bool syncCompletePending = false;  // Set by handler, acted on in wifiSyncLoop
+static bool notesRefreshPending = false;  // POST /notes wrote; refresh list in the loop
+
+// SoftAP — adapted from CrossPointWebServerActivity::startAccessPoint
+// (CrossInk, MIT). Diverges: WPA2 password (they use an open network),
+// no DNSServer captive portal, no QR code. The X3 joins by this SSID
+// and posts to the fixed IP.
+static constexpr char AP_SSID[] = "Ardosia";
+static constexpr char AP_PASSWORD[] = "ardosia12";  // WPA2, min 8 chars
+static constexpr int AP_CHANNEL = 1;
+static constexpr int AP_MAX_CONN = 4;
+static unsigned long apStartMs = 0;
+static constexpr unsigned long AP_NO_CLIENT_MS = 5UL * 60UL * 1000UL;
+static int lastSeenStations = -1;
+
+static void radioOff() {
+  WiFi.softAPdisconnect(true);
+  WiFi.disconnect(true);
+  WiFi.mode(WIFI_OFF);
+}
+
+static String currentSyncIp() {
+  const wifi_mode_t mode = WiFi.getMode();
+  if (mode == WIFI_AP || mode == WIFI_AP_STA) return WiFi.softAPIP().toString();
+  return WiFi.localIP().toString();
+}
 
 // --- DONE state ---
 static unsigned long doneStartMs = 0;
@@ -375,7 +401,7 @@ static void enterSyncingState() {
   resetSyncTracking();
   startHttpServer();
   snprintf(statusText, sizeof(statusText), "%s",
-           WiFi.localIP().toString().c_str());
+           currentSyncIp().c_str());
   syncState = SyncState::SYNCING;
   lastHttpActivityMs = millis();
   screenDirty = true;
@@ -384,8 +410,7 @@ static void enterSyncingState() {
 
 static void enterDoneState() {
   stopHttpServer();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  radioOff();
 
   syncState = SyncState::DONE;
   doneStartMs = millis();
@@ -406,7 +431,7 @@ static void pollConnection() {
     if (!usedSavedPassword) {
       syncState = SyncState::SAVE_PROMPT;
       snprintf(statusText, sizeof(statusText), "%s",
-               WiFi.localIP().toString().c_str());
+               currentSyncIp().c_str());
       screenDirty = true;
     } else {
       enterSyncingState();
@@ -529,15 +554,140 @@ static void handleNotFound() {
   server->send(404, "text/plain", "Not found");
 }
 
+// POST /notes?title=<url-encoded>&mode=append
+//
+// canRaw MUST stay false. Arduino-ESP32's raw path (Parsing.cpp:176-197)
+// streams the body and never calls _parseArguments, so ?title= is dropped
+// and the handler only ever sees "missing title". The plain-POST path
+// parses the query first, then exposes the body as arg("plain"). A clipping
+// is at most CLIPPING_TEXT_MAX (4 KB) on the X3; NOTE_POST_MAX_BODY is the
+// cap. server->on() is not used: its fourth argument is multipart upload.
+class NotesPostHandler : public RequestHandler {
+ public:
+  bool canHandle(HTTPMethod method, String uri) override {
+    return method == HTTP_POST && uri == "/notes";
+  }
+
+  bool handle(WebServer& srv, HTTPMethod /*method*/, String /*uri*/) override {
+    lastHttpActivityMs = millis();
+    if (!pcConnected) {
+      pcConnected = true;
+      screenDirty = true;
+    }
+
+    auto sendErr = [&](int code, const char* msg) {
+      srv.send(code, "text/plain", msg);
+      return true;
+    };
+
+    if (syncState != SyncState::AP_ACTIVE && syncState != SyncState::SYNCING) {
+      return sendErr(403, "forbidden");
+    }
+    if (!srv.hasArg("title")) {
+      return sendErr(400, "missing title");
+    }
+
+    const String title = srv.arg("title");
+    if (!utf8Validate(title.c_str(), title.length())) {
+      return sendErr(400, "invalid utf-8 title");
+    }
+    if (title.indexOf("..") >= 0 || title.indexOf('/') >= 0 || title.indexOf('\\') >= 0) {
+      return sendErr(400, "illegal title");
+    }
+
+    const String body = srv.arg("plain");
+    if (body.length() > NOTE_POST_MAX_BODY) {
+      return sendErr(413, "body too large");
+    }
+
+    const bool replace = srv.hasArg("mode") && srv.arg("mode") == "replace";
+    char chosenName[MAX_FILENAME_LEN];
+    if (!resolveNoteFilename(title.c_str(), replace, chosenName, MAX_FILENAME_LEN)) {
+      return sendErr(507, "too many files for this title");
+    }
+    if (!noteFilenameIsSafe(chosenName)) {
+      return sendErr(400, "illegal filename");
+    }
+
+    char path[320];
+    snprintf(path, sizeof(path), "/notes/%s", chosenName);
+    if (strncmp(path, "/notes/", 7) != 0 || strstr(path, "..") != nullptr) {
+      return sendErr(400, "illegal path");
+    }
+
+    const bool creating = !SdMan.exists(path);
+    if (creating && countNoteFiles() >= MAX_FILES) {
+      return sendErr(507, "too many notes");
+    }
+
+    // Peek the tail before opening for write: SdFat allows one handle
+    // per path on hardware.
+    int prefixN = 0;
+    if (!replace && body.length() > 0 && !creating) {
+      char tail[2] = {0, 0};
+      size_t tailLen = 0;
+      auto peek = SdMan.open(path, O_RDONLY);
+      if (peek) {
+        const uint32_t szPeek = peek.size();
+        if (szPeek >= 2 && peek.seek(szPeek - 2)) {
+          const int n = peek.read(tail, 2);
+          tailLen = n > 0 ? (size_t)n : 0;
+        } else if (szPeek == 1) {
+          const int n = peek.read(tail, 1);
+          tailLen = n > 0 ? (size_t)n : 0;
+        }
+        peek.close();
+      }
+      prefixN = noteAppendPrefixNewlines(tail, tailLen);
+    }
+
+    const oflag_t flags = replace
+        ? (O_WRONLY | O_CREAT | O_TRUNC)
+        : (O_WRONLY | O_CREAT | O_APPEND);
+    auto file = SdMan.open(path, flags);
+    if (!file) {
+      return sendErr(500, "open failed");
+    }
+
+    size_t appended = 0;
+    auto writeAll = [&](const char* p, size_t n) -> bool {
+      if (n == 0) return true;
+      const size_t wrote = file.write(reinterpret_cast<const uint8_t*>(p), n);
+      if (wrote != n) return false;
+      appended += n;
+      return true;
+    };
+    if (!writeAll("\n\n", (size_t)prefixN) ||
+        !writeAll(body.c_str(), body.length())) {
+      file.close();
+      return sendErr(500, "write failed");
+    }
+    const unsigned long sz = (unsigned long)file.size();
+    file.close();
+
+    char json[160];
+    snprintf(json, sizeof(json),
+             "{\"file\":\"%s\",\"size\":%lu,\"appended\":%u}",
+             chosenName, sz, (unsigned)appended);
+    srv.send(200, "application/json", json);
+
+    filesReceived++;
+    notesRefreshPending = true;
+    screenDirty = true;
+    return true;
+  }
+};
+
 static void startHttpServer() {
   if (server) return;
   server = new WebServer(80);
+  server->addHandler(new NotesPostHandler());
   server->on("/api/files", HTTP_GET, handleFileList);
   server->on("/api/sync-complete", HTTP_POST, handleSyncComplete);
   server->onNotFound(handleNotFound);
   server->begin();
   MDNS.begin("ardosia");
-  DBG_PRINTF("[SYNC] HTTP server started at %s\n", WiFi.localIP().toString().c_str());
+  DBG_PRINTF("[SYNC] HTTP server started at %s\n", currentSyncIp().c_str());
 }
 
 static void stopHttpServer() {
@@ -636,6 +786,7 @@ void syncHandleKey(uint8_t keyCode, uint8_t modifiers) {
       break;
 
     case SyncState::SYNCING:
+    case SyncState::AP_ACTIVE:
       if (keyCode == HID_KEY_ESCAPE) {
         wifiSyncStop();
       }
@@ -698,12 +849,41 @@ void wifiSyncStart() {
   DBG_PRINTLN("[SYNC] WiFi sync started");
 }
 
+void wifiSyncStartAp() {
+  if (syncActive) return;
+  syncActive = true;
+  resetSyncTracking();
+  lastSeenStations = -1;
+
+  // Adapted from CrossPointWebServerActivity::startAccessPoint
+  // (CrossInk, MIT). WPA2 on purpose: this AP accepts writes.
+  WiFi.mode(WIFI_AP);
+  delay(100);
+  const bool ok = WiFi.softAP(AP_SSID, AP_PASSWORD, AP_CHANNEL, false, AP_MAX_CONN);
+  if (!ok) {
+    strcpy(statusText, "AP failed");
+    syncState = SyncState::DONE;
+    doneStartMs = millis();
+    screenDirty = true;
+    DBG_PRINTLN("[SYNC] Failed to start Access Point");
+    return;
+  }
+  delay(100);
+
+  syncState = SyncState::AP_ACTIVE;
+  startHttpServer();
+  snprintf(statusText, sizeof(statusText), "%s", currentSyncIp().c_str());
+  apStartMs = millis();
+  lastHttpActivityMs = millis();
+  screenDirty = true;
+  DBG_PRINTF("[SYNC] AP \"%s\" up at %s\n", AP_SSID, statusText);
+}
+
 void wifiSyncStop() {
   if (!syncActive) return;
 
   stopHttpServer();
-  WiFi.disconnect(true);
-  WiFi.mode(WIFI_OFF);
+  radioOff();
 
   wifiPrefs.end();
   syncActive = false;
@@ -734,12 +914,45 @@ void wifiSyncLoop() {
 
     case SyncState::SYNCING:
       if (server) server->handleClient();
+      if (notesRefreshPending) {
+        notesRefreshPending = false;
+        refreshFileList();
+      }
       if (syncCompletePending) {
         syncCompletePending = false;
         enterDoneState();
       } else if (millis() - lastHttpActivityMs > SYNC_TIMEOUT_MS) {
         DBG_PRINTLN("[SYNC] Timeout — no HTTP activity for 60s");
         enterDoneState();
+      }
+      break;
+
+    case SyncState::AP_ACTIVE:
+      if (server) server->handleClient();
+      if (notesRefreshPending) {
+        notesRefreshPending = false;
+        refreshFileList();
+      }
+      {
+        const int stations = (int)WiFi.softAPgetStationNum();
+        if (stations != lastSeenStations) {
+          if (lastSeenStations == 0 && stations > 0) {
+            // Grace period: the X3 takes a while to join; don't start the
+            // 60 s idle clock until a station is actually associated.
+            lastHttpActivityMs = millis();
+          }
+          lastSeenStations = stations;
+          screenDirty = true;
+        }
+        if (stations == 0) {
+          if (millis() - apStartMs > AP_NO_CLIENT_MS) {
+            DBG_PRINTLN("[SYNC] AP timeout — no client in 5 min");
+            enterDoneState();
+          }
+        } else if (millis() - lastHttpActivityMs > SYNC_TIMEOUT_MS) {
+          DBG_PRINTLN("[SYNC] AP idle — no HTTP for 60s");
+          enterDoneState();
+        }
       }
       break;
 
@@ -817,4 +1030,30 @@ int getSyncFilesReceived() {
 
 bool isPcConnected() {
   return pcConnected;
+}
+
+const char* getApSsid() { return AP_SSID; }
+const char* getApPassword() { return AP_PASSWORD; }
+
+int getApStationCount() {
+  if (syncState != SyncState::AP_ACTIVE) return 0;
+  return (int)WiFi.softAPgetStationNum();
+}
+
+bool wifiSyncUiChanged() {
+  static int lastSent = -1, lastRecv = -1, lastStations = -1;
+  static bool lastPc = false;
+  static SyncState lastState = SyncState::SCANNING;
+  const int stations = getApStationCount();
+  const bool changed = (filesSent != lastSent)
+                    || (filesReceived != lastRecv)
+                    || (stations != lastStations)
+                    || (pcConnected != lastPc)
+                    || (syncState != lastState);
+  lastSent = filesSent;
+  lastRecv = filesReceived;
+  lastStations = stations;
+  lastPc = pcConnected;
+  lastState = syncState;
+  return changed;
 }

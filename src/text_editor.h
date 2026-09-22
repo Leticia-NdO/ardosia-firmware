@@ -46,4 +46,10 @@ const char* editorGetCurrentFile();
 const char* editorGetCurrentTitle();
 bool editorHasUnsavedChanges();
 void editorSetUnsavedChanges(bool v);
+
+// A file that does not fit TEXT_BUFFER_SIZE is opened read-only so a
+// truncated prefix cannot be saved back over the original (and its .bak).
+bool editorIsReadOnly();
+void editorSetReadOnly(bool v);
+
 int editorGetWordCount();

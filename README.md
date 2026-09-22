@@ -221,11 +221,11 @@ python3 sync/ardosia_sync.py
 
 #### How sync works
 
-- One-way backup: device → PC. Nothing is ever uploaded or deleted.
+- One-way backup (STA Sync): device → PC. The PC never uploads or deletes.
 - Files already on the PC with the same name and size are skipped
 - Files deleted from the device are **not** deleted from the PC — they stay as a backup
-- The device HTTP server is **read-only** — no one on the network can modify or delete files
-- WiFi turns off automatically after sync completes or after 60 seconds of no activity
+- **Sync (Hotspot)** raises a WPA2 access point (`Ardosia`) so another device can `POST /notes` and append to a note. POST is accepted only while the hotspot (or STA sync) is up; the path is sanitized and the body is capped.
+- WiFi turns off automatically after sync completes, after 60 seconds of no HTTP activity, or — on the hotspot with nobody joined — after 5 minutes
 
 #### Sync controls
 

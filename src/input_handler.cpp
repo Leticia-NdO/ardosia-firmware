@@ -294,22 +294,28 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
   if (keyCode == HID_KEY_ENTER) {
     if (renameBufferLen > 0) {
       if (renameReturnState == UIState::TEXT_EDITOR) {
-        editorSetCurrentTitle(renameBuffer);
         if (editorGetCurrentFile()[0] == '\0') {
           // New file — derive filename from title
           char filename[MAX_FILENAME_LEN];
-          deriveUniqueFilename(renameBuffer, filename, MAX_FILENAME_LEN);
+          if (!deriveUniqueFilename(renameBuffer, filename, MAX_FILENAME_LEN)) {
+            return;  // stay on the rename screen; 99 collisions is rare
+          }
           editorSetCurrentFile(filename);
         } else {
           // Existing file — rename on disk to match new title
-          updateFileTitle(editorGetCurrentFile(), renameBuffer);
+          if (!updateFileTitle(editorGetCurrentFile(), renameBuffer)) {
+            return;
+          }
         }
+        editorSetCurrentTitle(renameBuffer);
         editorSetUnsavedChanges(true);
         saveCurrentFile();
       } else {
         // Updating title of a file selected in the browser
         FileInfo* files = getFileList();
-        updateFileTitle(files[selectedFileIndex].filename, renameBuffer);
+        if (!updateFileTitle(files[selectedFileIndex].filename, renameBuffer)) {
+          return;
+        }
       }
     }
     currentState = renameReturnState;
@@ -363,7 +369,7 @@ static void dispatchEvent(const KeyEvent& event) {
 
   switch (currentState) {
     case UIState::MAIN_MENU: {
-      int menuCount = 4 + otaAppCount;
+      int menuCount = BASE_MENU_COUNT + otaAppCount;
       if (event.keyCode == HID_KEY_DOWN) {
         mainMenuSelection = (mainMenuSelection + 1) % menuCount;
         screenDirty = true;
@@ -371,22 +377,26 @@ static void dispatchEvent(const KeyEvent& event) {
         mainMenuSelection = (mainMenuSelection - 1 + menuCount) % menuCount;
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_ENTER) {
-        if (mainMenuSelection == 0) {
+        if (mainMenuSelection == MENU_BROWSE) {
           refreshFileList();
           currentState = UIState::FILE_BROWSER;
           screenDirty = true;
-        } else if (mainMenuSelection == 1) {
+        } else if (mainMenuSelection == MENU_NEW_NOTE) {
           createNewFile();
           openTitleEdit("Untitled", UIState::TEXT_EDITOR);
-        } else if (mainMenuSelection == 2) {
+        } else if (mainMenuSelection == MENU_SETTINGS) {
           currentState = UIState::SETTINGS;
           screenDirty = true;
-        } else if (mainMenuSelection == 3) {
+        } else if (mainMenuSelection == MENU_SYNC) {
           wifiSyncStart();
           currentState = UIState::WIFI_SYNC;
           screenDirty = true;
-        } else if (mainMenuSelection >= 4) {
-          switchToOtaApp(mainMenuSelection - 4);
+        } else if (mainMenuSelection == MENU_SYNC_AP) {
+          wifiSyncStartAp();
+          currentState = UIState::WIFI_SYNC;
+          screenDirty = true;
+        } else if (mainMenuSelection >= BASE_MENU_COUNT) {
+          switchToOtaApp(mainMenuSelection - BASE_MENU_COUNT);
         }
       }
       break;

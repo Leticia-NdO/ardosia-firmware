@@ -80,3 +80,74 @@ void utf8TrimPartialTail(char* buf) {
   const size_t need = static_cast<size_t>(utf8SeqLen(static_cast<unsigned char>(buf[start])));
   if (start + need > len) buf[start] = '\0';
 }
+
+uint32_t utf8NextCodepointBounded(const unsigned char** p, const unsigned char* end) {
+  if (p == nullptr || *p == nullptr || *p >= end) return 0;
+  const unsigned char lead = **p;
+  if (lead == 0) return 0;
+
+  const int bytes = utf8SeqLen(lead);
+  if (*p + bytes > end) return 0;
+  for (int i = 0; i < bytes; i++) {
+    if ((*p)[i] == 0) return 0;
+  }
+
+  uint32_t cp;
+  if (bytes == 1) {
+    cp = lead;
+  } else {
+    cp = static_cast<uint32_t>(lead & ((1 << (7 - bytes)) - 1));
+    for (int i = 1; i < bytes; i++) {
+      cp = (cp << 6) | static_cast<uint32_t>((*p)[i] & 0x3F);
+    }
+  }
+  *p += bytes;
+  return cp;
+}
+
+bool utf8Validate(const char* s, size_t n) {
+  if (n == 0) return true;
+  if (s == nullptr) return false;
+
+  const unsigned char* p = reinterpret_cast<const unsigned char*>(s);
+  const unsigned char* const end = p + n;
+  while (p < end) {
+    const unsigned char c = *p;
+    if (c == 0) return false;  // embedded NUL
+    int bytes;
+    uint32_t minCp;
+    if (c < 0x80) {
+      bytes = 1;
+      minCp = 0;
+    } else if ((c >> 5) == 0x6) {
+      bytes = 2;
+      minCp = 0x80;
+    } else if ((c >> 4) == 0xE) {
+      bytes = 3;
+      minCp = 0x800;
+    } else if ((c >> 3) == 0x1E) {
+      bytes = 4;
+      minCp = 0x10000;
+    } else {
+      return false;  // continuation 10xxxxxx or invalid lead 11111xxx
+    }
+
+    if (p + bytes > end) return false;
+
+    uint32_t cp;
+    if (bytes == 1) {
+      cp = c;
+    } else {
+      cp = static_cast<uint32_t>(c & ((1 << (7 - bytes)) - 1));
+      for (int i = 1; i < bytes; i++) {
+        if ((p[i] & 0xC0) != 0x80) return false;
+        cp = (cp << 6) | static_cast<uint32_t>(p[i] & 0x3F);
+      }
+    }
+    if (cp < minCp) return false;                       // overlong
+    if (cp >= 0xD800 && cp <= 0xDFFF) return false;     // UTF-16 surrogate
+    if (cp > 0x10FFFF) return false;
+    p += bytes;
+  }
+  return true;
+}

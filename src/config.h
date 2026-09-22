@@ -74,7 +74,20 @@ extern int otaAppCount;
 
 // --- Buffer/Queue Sizes ---
 static constexpr size_t TEXT_BUFFER_SIZE = 16384;
-static constexpr int MAX_FILES = 50;
+static constexpr int MAX_FILES = 100;
+// POST /notes rolls to title_2.txt once the current file reaches this.
+// Kept under TEXT_BUFFER_SIZE so the editor can still open the result.
+static constexpr size_t NOTE_ROLLOVER_SIZE = 14 * 1024;
+static constexpr size_t NOTE_POST_MAX_BODY = 32 * 1024;
+
+// Main menu: keep these in lockstep with the label array in drawMainMenu
+// and the switch in dispatchEvent. A bare `4` used to appear in five places.
+static constexpr int MENU_BROWSE     = 0;
+static constexpr int MENU_NEW_NOTE   = 1;
+static constexpr int MENU_SETTINGS   = 2;
+static constexpr int MENU_SYNC       = 3;
+static constexpr int MENU_SYNC_AP    = 4;
+static constexpr int BASE_MENU_COUNT = 5;
 static constexpr int INPUT_QUEUE_SIZE = 50;
 static constexpr int MAX_LINES = 1024;
 

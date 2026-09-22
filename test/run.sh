@@ -29,6 +29,13 @@ $CXX $FLAGS -o /tmp/ardosia_test_ptbr \
 /tmp/ardosia_test_ptbr || status=1
 
 echo
+$CXX $FLAGS -DRELEASE_BUILD -I host_stubs -I ../src \
+    -o /tmp/ardosia_test_files \
+    test_files.cpp host_stubs/SDCardManager.cpp \
+    ../src/utf8_util.cpp ../src/file_manager.cpp ../src/text_editor.cpp
+/tmp/ardosia_test_files || status=1
+
+echo
 $CXX $FLAGS -o /tmp/ardosia_test_sleep \
     test_sleep.cpp ../src/sleep_layout.cpp
 /tmp/ardosia_test_sleep || status=1

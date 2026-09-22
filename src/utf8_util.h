@@ -46,3 +46,21 @@ size_t utf8AdvanceCodepoints(const char* buf, size_t from, size_t to, int n);
 // a title cut at its length limit can end in half an "á", which the renderer
 // then draws as a replacement glyph.
 void utf8TrimPartialTail(char* buf);
+
+// Decode one codepoint at *p, never reading past `end` and stopping if a NUL
+// appears in any byte of the sequence — not just the lead.
+//
+// lib/Utf8/utf8NextCodepoint is vendored and tests the NUL only on the lead
+// byte, then advances and reads `bytes` bytes unconditionally. A truncated
+// 3- or 4-byte sequence at the end of a C string therefore reads past the
+// terminator. Do not use that decoder on untrusted or length-capped input.
+//
+// Returns 0 at end, at NUL, or when the sequence would run past `end`.
+// *p is advanced only on a complete sequence.
+uint32_t utf8NextCodepointBounded(const unsigned char** p, const unsigned char* end);
+
+// True iff `s[0..n)` is well-formed UTF-8. Rejects a lone continuation, a
+// lead whose declared continuations are missing or not continuation bytes,
+// a truncated sequence, an overlong encoding, and UTF-16 surrogates.
+// An empty range is valid. Embedded NUL is invalid.
+bool utf8Validate(const char* s, size_t n);
