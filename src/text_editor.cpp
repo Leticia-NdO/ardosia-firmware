@@ -7,6 +7,12 @@
 static char textBuffer[TEXT_BUFFER_SIZE];
 static size_t textLength = 0;
 static int cursorPosition = 0;
+static int selectionAnchor = 0;
+
+// Lives for the whole boot, so a copy can be pasted into another note.
+// Not on the heap: the C3 fragments, and this buffer is never freed.
+static char clipboard[TEXT_BUFFER_SIZE];
+static size_t clipboardLen = 0;
 
 // --- File metadata ---
 static char currentFile[MAX_FILENAME_LEN] = "";
@@ -111,10 +117,51 @@ static void ensureCursorVisible(int visibleLines) {
   if (viewportStartLine >= lineCount) viewportStartLine = std::max(0, lineCount - 1);
 }
 
+static bool selectionActive() {
+  return selectionAnchor != cursorPosition;
+}
+
+static void selectionBounds(int* lo, int* hi) {
+  if (selectionAnchor < cursorPosition) {
+    *lo = selectionAnchor;
+    *hi = cursorPosition;
+  } else {
+    *lo = cursorPosition;
+    *hi = selectionAnchor;
+  }
+}
+
+// Drops the selected bytes and leaves the caret at the start of the gap.
+// Caller sets the dirty flags. No-op when nothing is selected.
+static void removeSelection() {
+  if (!selectionActive()) return;
+  int lo, hi;
+  selectionBounds(&lo, &hi);
+  memmove(textBuffer + lo, textBuffer + hi, textLength - (size_t)hi);
+  textLength -= (size_t)(hi - lo);
+  textBuffer[textLength] = '\0';
+  cursorPosition = lo;
+  selectionAnchor = lo;
+}
+
+// True if `added` bytes fit once the selection (if any) is removed.
+// Checked before any mutation: a paste that does not fit leaves the note as it was.
+static bool fitsAfterRemovingSelection(size_t added) {
+  size_t removing = 0;
+  if (selectionActive()) {
+    int lo, hi;
+    selectionBounds(&lo, &hi);
+    removing = (size_t)(hi - lo);
+  }
+  const size_t room = (TEXT_BUFFER_SIZE - 1) - (textLength - removing);
+  return added <= room;
+}
+
 void editorInit() {
   memset(textBuffer, 0, TEXT_BUFFER_SIZE);
   textLength = 0;
   cursorPosition = 0;
+  selectionAnchor = 0;
   currentFile[0] = '\0';
   strncpy(currentTitle, "Untitled", MAX_TITLE_LEN - 1);
   unsavedChanges = false;
@@ -128,6 +175,7 @@ void editorClear() {
   memset(textBuffer, 0, TEXT_BUFFER_SIZE);
   textLength = 0;
   cursorPosition = 0;
+  selectionAnchor = 0;
   unsavedChanges = false;
   readOnly = false;
   viewportStartLine = 0;
@@ -139,6 +187,7 @@ void editorLoadBuffer(size_t length) {
   textLength = length;
   textBuffer[textLength] = '\0';
   cursorPosition = (int)textLength;  // Start at end
+  selectionAnchor = cursorPosition;
   viewportStartLine = 0;
   lineBreaksDirty = true;
   editorRecalculateLines();
@@ -172,7 +221,11 @@ void editorInsertCodepoint(uint32_t cp) {
   char enc[4];
   const int n = utf8Encode(cp, enc);
   if (n <= 0) return;
-  if (textLength + (size_t)n >= TEXT_BUFFER_SIZE - 1) return;
+  if (!fitsAfterRemovingSelection((size_t)n)) return;
+
+  // A selection is replaced by this character. The fit check above already
+  // accounted for the bytes that are about to leave, so this cannot overflow.
+  removeSelection();
 
   // Shift the tail right by the encoded length, then drop the bytes in.
   memmove(textBuffer + cursorPosition + n, textBuffer + cursorPosition,
@@ -181,6 +234,7 @@ void editorInsertCodepoint(uint32_t cp) {
   cursorPosition += n;
   textLength += (size_t)n;
   textBuffer[textLength] = '\0';
+  selectionAnchor = cursorPosition;
   unsavedChanges = true;
   lineBreaksDirty = true;
 
@@ -190,6 +244,14 @@ void editorInsertCodepoint(uint32_t cp) {
 
 void editorDeleteChar() {
   if (readOnly) return;
+  if (selectionActive()) {
+    removeSelection();
+    unsavedChanges = true;
+    lineBreaksDirty = true;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
   if (cursorPosition <= 0 || textLength == 0) return;
 
   // Remove the whole character, not one byte: deleting half of "á" would leave
@@ -200,6 +262,7 @@ void editorDeleteChar() {
   memmove(textBuffer + start, textBuffer + cursorPosition,
           textLength - (size_t)cursorPosition);
   cursorPosition = start;
+  selectionAnchor = cursorPosition;
   textLength -= n;
   textBuffer[textLength] = '\0';
   unsavedChanges = true;
@@ -211,6 +274,14 @@ void editorDeleteChar() {
 
 void editorDeleteForward() {
   if (readOnly) return;
+  if (selectionActive()) {
+    removeSelection();
+    unsavedChanges = true;
+    lineBreaksDirty = true;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
   if (cursorPosition >= (int)textLength) return;
 
   const size_t end = utf8NextStart(textBuffer, textLength, (size_t)cursorPosition);
@@ -218,6 +289,7 @@ void editorDeleteForward() {
   memmove(textBuffer + cursorPosition, textBuffer + end, textLength - end);
   textLength -= n;
   textBuffer[textLength] = '\0';
+  selectionAnchor = cursorPosition;
   unsavedChanges = true;
   lineBreaksDirty = true;
 
@@ -225,24 +297,42 @@ void editorDeleteForward() {
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorLeft() {
+void editorMoveCursorLeft(bool extend) {
+  if (!extend && selectionActive()) {
+    cursorPosition = selectionAnchor < cursorPosition ? selectionAnchor : cursorPosition;
+    selectionAnchor = cursorPosition;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
   if (cursorPosition > 0) {
     cursorPosition = (int)utf8PrevStart(textBuffer, (size_t)cursorPosition);
+    if (!extend) selectionAnchor = cursorPosition;
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
 }
 
-void editorMoveCursorRight() {
+void editorMoveCursorRight(bool extend) {
+  if (!extend && selectionActive()) {
+    cursorPosition = selectionAnchor > cursorPosition ? selectionAnchor : cursorPosition;
+    selectionAnchor = cursorPosition;
+    editorRecalculateLines();
+    ensureCursorVisible(storedVisibleLines);
+    return;
+  }
   if (cursorPosition < (int)textLength) {
     cursorPosition = (int)utf8NextStart(textBuffer, textLength, (size_t)cursorPosition);
+    if (!extend) selectionAnchor = cursorPosition;
     editorRecalculateLines();
     ensureCursorVisible(storedVisibleLines);
   }
 }
 
-void editorMoveCursorUp() {
-  // cursorLine/cursorCol are already valid from the previous operation
+void editorMoveCursorUp(bool extend) {
+  // cursorLine/cursorCol are already valid from the previous operation.
+  // Without Shift the selection drops and the move starts from the caret.
+  if (!extend) selectionAnchor = cursorPosition;
   if (cursorLine <= 0) return;
 
   // cursorCol is a byte offset; the column the user sees is a character count,
@@ -258,11 +348,13 @@ void editorMoveCursorUp() {
 
   cursorPosition = (int)utf8AdvanceCodepoints(textBuffer, (size_t)lineStart,
                                               (size_t)lineEnd, col);
+  if (!extend) selectionAnchor = cursorPosition;
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorDown() {
+void editorMoveCursorDown(bool extend) {
+  if (!extend) selectionAnchor = cursorPosition;
   if (cursorLine >= lineCount - 1) return;
 
   const int col = utf8CountRange(textBuffer, (size_t)linePositions[cursorLine],
@@ -275,17 +367,19 @@ void editorMoveCursorDown() {
 
   cursorPosition = (int)utf8AdvanceCodepoints(textBuffer, (size_t)lineStart,
                                               (size_t)lineEnd, col);
+  if (!extend) selectionAnchor = cursorPosition;
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorHome() {
+void editorMoveCursorHome(bool extend) {
   cursorPosition = linePositions[cursorLine];
+  if (!extend) selectionAnchor = cursorPosition;
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }
 
-void editorMoveCursorEnd() {
+void editorMoveCursorEnd(bool extend) {
   int lineEnd;
   if (cursorLine + 1 < lineCount) {
     lineEnd = linePositions[cursorLine + 1];
@@ -295,6 +389,60 @@ void editorMoveCursorEnd() {
     lineEnd = (int)textLength;
   }
   cursorPosition = lineEnd;
+  if (!extend) selectionAnchor = cursorPosition;
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+}
+
+bool editorHasSelection() { return selectionActive(); }
+
+bool editorGetSelectionRange(int* lo, int* hi) {
+  if (!selectionActive() || lo == nullptr || hi == nullptr) return false;
+  selectionBounds(lo, hi);
+  return true;
+}
+
+void editorSelectAll() {
+  selectionAnchor = 0;
+  cursorPosition = (int)textLength;
+  if (!selectionActive()) return;
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+}
+
+void editorCopy() {
+  if (!selectionActive()) return;
+  int lo, hi;
+  selectionBounds(&lo, &hi);
+  clipboardLen = (size_t)(hi - lo);
+  memcpy(clipboard, textBuffer + lo, clipboardLen);
+  clipboard[clipboardLen] = '\0';
+}
+
+void editorCut() {
+  if (readOnly || !selectionActive()) return;
+  editorCopy();
+  removeSelection();
+  unsavedChanges = true;
+  lineBreaksDirty = true;
+  editorRecalculateLines();
+  ensureCursorVisible(storedVisibleLines);
+}
+
+void editorPaste() {
+  if (readOnly || clipboardLen == 0) return;
+  if (!fitsAfterRemovingSelection(clipboardLen)) return;
+
+  removeSelection();
+  memmove(textBuffer + cursorPosition + clipboardLen, textBuffer + cursorPosition,
+          textLength - (size_t)cursorPosition);
+  memcpy(textBuffer + cursorPosition, clipboard, clipboardLen);
+  cursorPosition += (int)clipboardLen;
+  textLength += clipboardLen;
+  textBuffer[textLength] = '\0';
+  selectionAnchor = cursorPosition;
+  unsavedChanges = true;
+  lineBreaksDirty = true;
   editorRecalculateLines();
   ensureCursorVisible(storedVisibleLines);
 }

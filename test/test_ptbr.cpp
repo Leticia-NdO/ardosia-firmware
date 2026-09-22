@@ -306,6 +306,129 @@ static void testEditor() {
   editorSetCharsPerLine(80);
   type("ação é boa");
   check(editorGetWordCount() == 3, "\"ação é boa\" is 3 words");
+
+  printf("editor: selection and clipboard\n");
+
+  editorInit();
+  editorSelectAll();
+  check(!editorHasSelection(), "select-all on an empty note is not a selection");
+
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("a");
+  editorMoveCursorHome();
+  editorMoveCursorLeft(true);
+  check(!editorHasSelection(), "shift-left at the start selects nothing");
+
+  // "xyaá" is 5 bytes; á occupies [3, 5). One shift-left must take both bytes.
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("xyaá");
+  editorMoveCursorLeft(true);
+  int lo = -1, hi = -1;
+  check(editorGetSelectionRange(&lo, &hi), "shift-left selects");
+  check(lo == 3 && hi == 5, "shift-left takes both bytes of á, not the trailing one");
+  editorMoveCursorLeft(false);
+  check(!editorHasSelection(), "left clears the selection");
+  check(editorGetCursorPosition() == 3, "left jumps to the start of the selection and stops");
+  editorMoveCursorLeft(false);
+  check(editorGetCursorPosition() == 2, "a second left moves one character");
+
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("abcd");
+  editorMoveCursorLeft(true);
+  editorMoveCursorLeft(true);             // "cd", caret at the start of it
+  editorMoveCursorRight(false);
+  check(!editorHasSelection(), "right clears the selection");
+  check(editorGetCursorPosition() == 4, "right jumps to the end, without an extra step");
+
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("abcd");
+  editorMoveCursorLeft(true);
+  editorMoveCursorLeft(true);
+  editorInsertCodepoint('z');
+  checkStr(editorGetBuffer(), "abz", "typing replaces the selection");
+  check(!editorHasSelection(), "typing clears the selection");
+
+  // Two inserts in one key (a dead accent with no composed form): only the
+  // first one consumes the selection.
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("abcd");
+  editorMoveCursorLeft(true);
+  editorMoveCursorLeft(true);
+  editorInsertCodepoint('z');
+  editorInsertCodepoint('y');
+  checkStr(editorGetBuffer(), "abzy", "only the first insert consumes the selection");
+
+  // Caret sits at the start of "c". Backspace must delete "c", not the "b" before it.
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("abcd");
+  editorMoveCursorLeft(false);
+  editorMoveCursorLeft(true);
+  editorDeleteChar();
+  checkStr(editorGetBuffer(), "abd", "backspace deletes the selection, not the letter before it");
+
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("abcd");
+  editorMoveCursorHome();
+  editorMoveCursorRight(true);            // "a"
+  editorDeleteForward();
+  checkStr(editorGetBuffer(), "bcd", "delete removes the selection, not the next character");
+
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("ab\ncd");
+  editorMoveCursorHome();                 // start of "cd"
+  editorMoveCursorUp(true);
+  lo = -1;
+  hi = -1;
+  check(editorGetSelectionRange(&lo, &hi), "shift-up selects");
+  check(lo == 0 && hi == 3, "shift-up reaches the previous line, including the break");
+
+  editorInit();
+  editorSetCharsPerLine(80);
+  type("ação");
+  editorSetReadOnly(true);
+  editorSelectAll();
+  check(editorHasSelection(), "read-only can select");
+  editorCopy();
+  const size_t kept = editorGetLength();
+  editorCut();
+  editorPaste();
+  editorInsertCodepoint('z');
+  editorDeleteChar();
+  check(editorGetLength() == kept, "read-only blocks cut, paste, and typing");
+  checkStr(editorGetBuffer(), "ação", "read-only text unchanged");
+  // Copy with nothing selected must not wipe the previous copy.
+  editorMoveCursorLeft(false);
+  editorCopy();
+  editorSetReadOnly(false);
+  editorClear();
+  check(!editorHasSelection(), "clear drops the selection");
+  editorPaste();
+  checkStr(editorGetBuffer(), "ação", "copy survives clear and pastes into the new note");
+
+  // A full buffer does not fit on top of "ab", but it does fit in "ab"'s place.
+  editorInit();
+  memset(editorGetBuffer(), 'x', TEXT_BUFFER_SIZE - 1);
+  editorLoadBuffer(TEXT_BUFFER_SIZE - 1);
+  editorSelectAll();
+  check(editorHasSelection(), "a full note can be selected");
+  editorCopy();
+  editorClear();
+  type("ab");
+  editorPaste();
+  checkStr(editorGetBuffer(), "ab", "paste that does not fit is refused");
+  editorSelectAll();
+  editorPaste();
+  check(editorGetLength() == TEXT_BUFFER_SIZE - 1, "paste over a selection uses the freed room");
+  check(editorGetBuffer()[0] == 'x', "the pasted bytes are the copy");
+  check(!editorHasSelection(), "paste leaves no selection");
 }
 
 int main() {

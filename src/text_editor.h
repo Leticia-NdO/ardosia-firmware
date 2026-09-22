@@ -19,13 +19,29 @@ void editorInsertCodepoint(uint32_t cp);
 void editorDeleteChar();     // Backspace
 void editorDeleteForward();  // Delete key
 
-// Cursor movement
-void editorMoveCursorLeft();
-void editorMoveCursorRight();
-void editorMoveCursorUp();
-void editorMoveCursorDown();
-void editorMoveCursorHome();
-void editorMoveCursorEnd();
+// Cursor movement. extend=true keeps an anchor so the range between the
+// anchor and the cursor becomes the selection (Shift+arrow). extend=false
+// collapses an existing selection: left/right jump to its edge and stop,
+// the other keys drop it and then move from the caret.
+void editorMoveCursorLeft(bool extend = false);
+void editorMoveCursorRight(bool extend = false);
+void editorMoveCursorUp(bool extend = false);
+void editorMoveCursorDown(bool extend = false);
+void editorMoveCursorHome(bool extend = false);
+void editorMoveCursorEnd(bool extend = false);
+
+// Selection is empty when the anchor and the cursor coincide. The range is
+// a half-open byte interval [lo, hi) on character boundaries.
+void editorSelectAll();
+bool editorHasSelection();
+bool editorGetSelectionRange(int* lo, int* hi);
+
+// Clipboard is internal to the device. Copy works on a read-only note;
+// cut and paste do not. Paste that would exceed TEXT_BUFFER_SIZE changes
+// nothing. The clipboard survives opening or creating another note.
+void editorCopy();
+void editorCut();
+void editorPaste();
 
 // Line/viewport management
 void editorSetCharsPerLine(int cpl);

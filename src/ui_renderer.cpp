@@ -12,6 +12,7 @@
 #include <HalDisplay.h>
 #include <EpdFont.h>
 #include <EpdFontFamily.h>
+#include <cstring>
 
 // External variables
 extern bool autoReconnectEnabled;
@@ -371,9 +372,28 @@ void drawFileBrowser(GfxRenderer& renderer, HalGPIO& gpio) {
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
 }
 
-// Helper: draw a single editor line from the buffer
+// Copy buf[from, to) into dest (capped) and return its pixel advance.
+// The font paints only ink, so a selection band measures with the same
+// advance the glyphs will use, or the highlight and the letters drift apart.
+static int takeSpan(GfxRenderer& renderer, int fontId, const char* src,
+                    int from, int to, char* dest, size_t cap) {
+  dest[0] = '\0';
+  if (to <= from || cap < 2) return 0;
+  size_t n = (size_t)(to - from);
+  if (n > cap - 1) n = cap - 1;
+  memcpy(dest, src + from, n);
+  dest[n] = '\0';
+  utf8TrimPartialTail(dest);
+  if (dest[0] == '\0') return 0;
+  return renderer.getTextAdvanceX(fontId, dest);
+}
+
+// Helper: draw a single editor line from the buffer.
+// The line is drawn normally first. A selected span is then covered by a
+// solid band and redrawn in the opposite ink: drawText paints only the
+// glyph, so white letters with no band would disappear on a white page.
 static void drawEditorLine(GfxRenderer& renderer, int lineIdx, int x, int yPos,
-                           int maxW, bool tc) {
+                           int maxW, bool tc, int lineHeight) {
   char* buf = editorGetBuffer();
   size_t bufLen = editorGetLength();
   int totalLines = editorGetLineCount();
@@ -391,6 +411,35 @@ static void drawEditorLine(GfxRenderer& renderer, int lineIdx, int x, int yPos,
     lineBuf[copyLen] = '\0';
     utf8TrimPartialTail(lineBuf);   // clamping to sizeof(lineBuf) may split a character
     drawClippedText(renderer, editorFontId(fontSize), x, yPos, lineBuf, maxW, tc);
+  }
+
+  int selLo = 0, selHi = 0;
+  if (!editorGetSelectionRange(&selLo, &selHi)) return;
+
+  int ovLo = (selLo > lineStart) ? selLo : lineStart;
+  int ovHi = (selHi < dispEnd) ? selHi : dispEnd;
+  if (ovLo > dispEnd) ovLo = dispEnd;
+  if (ovHi < ovLo) ovHi = ovLo;
+
+  const int fontId = editorFontId(fontSize);
+  char span[256];
+
+  if (ovHi > ovLo) {
+    const int before = takeSpan(renderer, fontId, buf, lineStart, ovLo, span, sizeof(span));
+    const int selW = takeSpan(renderer, fontId, buf, ovLo, ovHi, span, sizeof(span));
+    int remain = maxW - before;
+    if (remain < 0) remain = 0;
+    int band = selW < remain ? selW : remain;
+    if (band > 0 && span[0] != '\0') {
+      clippedFillRect(renderer, x + before, yPos, band, lineHeight, tc);
+      drawClippedText(renderer, fontId, x + before, yPos, span, remain, !tc);
+    }
+  } else if (selHi > dispEnd && selLo < lineEnd) {
+    // Blank line, or a selected break sitting past the last glyph.
+    const int before = takeSpan(renderer, fontId, buf, lineStart, dispEnd, span, sizeof(span));
+    int spaceW = renderer.getSpaceWidth(fontId);
+    if (spaceW < 2) spaceW = 8;
+    clippedFillRect(renderer, x + before, yPos, spaceW, lineHeight, tc);
   }
 }
 
@@ -523,7 +572,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
 
     // Draw only the current line
     if (curLine < totalLines) {
-      drawEditorLine(renderer, curLine, 10, centerY, sw - 20, tc);
+      drawEditorLine(renderer, curLine, 10, centerY, sw - 20, tc, lineHeight);
     }
 
     // Draw cursor
@@ -564,7 +613,7 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
     // Draw lines for this page
     for (int i = 0; i < linesPerPage && (pageStart + i) < totalLines; i++) {
       int yPos = textAreaTop + (i * lineHeight);
-      drawEditorLine(renderer, pageStart + i, 10, yPos, sw - 20, tc);
+      drawEditorLine(renderer, pageStart + i, 10, yPos, sw - 20, tc, lineHeight);
     }
 
     // Draw cursor if on this page
@@ -587,13 +636,11 @@ void drawTextEditor(GfxRenderer& renderer, HalGPIO& gpio) {
   editorSetVisibleLines(visibleLines);
 
   int vpStart = editorGetViewportStart();
-  char* buf = editorGetBuffer();
-  size_t bufLen = editorGetLength();
 
   // Draw visible lines
   for (int i = 0; i < visibleLines && (vpStart + i) < totalLines; i++) {
     int yPos = textAreaTop + (i * lineHeight);
-    drawEditorLine(renderer, vpStart + i, 10, yPos, sw - 20, tc);
+    drawEditorLine(renderer, vpStart + i, 10, yPos, sw - 20, tc, lineHeight);
   }
 
   // Draw cursor

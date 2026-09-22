@@ -198,6 +198,25 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
       screenDirty = true;
       return;
     }
+    if (keyCode == HID_KEY_A) {
+      editorSelectAll();
+      screenDirty = true;
+      return;
+    }
+    if (keyCode == HID_KEY_C) {
+      editorCopy();
+      return;
+    }
+    if (keyCode == HID_KEY_X) {
+      editorCut();
+      screenDirty = true;
+      return;
+    }
+    if (keyCode == HID_KEY_V) {
+      editorPaste();
+      screenDirty = true;
+      return;
+    }
     // Ctrl+Left/Right: jump pages in pagination mode
     if (writingMode == WritingMode::PAGINATION) {
       int pageSize = editorGetStoredVisibleLines();
@@ -243,13 +262,16 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
     screenDirty = true;
     return;
   }
+  // Shift is on this same press. Ctrl never reaches here: the block above
+  // already returned, so Ctrl+arrow keeps its old meaning (page turn, or nothing).
+  const bool extend = isShift(modifiers);
   switch (keyCode) {
-    case HID_KEY_LEFT:      inputClearDeadKey(); editorMoveCursorLeft();  screenDirty = true; return;
-    case HID_KEY_RIGHT:     inputClearDeadKey(); editorMoveCursorRight(); screenDirty = true; return;
-    case HID_KEY_UP:        inputClearDeadKey(); editorMoveCursorUp();    screenDirty = true; return;
-    case HID_KEY_DOWN:      inputClearDeadKey(); editorMoveCursorDown();  screenDirty = true; return;
-    case HID_KEY_HOME:      inputClearDeadKey(); editorMoveCursorHome();  screenDirty = true; return;
-    case HID_KEY_END:       inputClearDeadKey(); editorMoveCursorEnd();   screenDirty = true; return;
+    case HID_KEY_LEFT:      inputClearDeadKey(); editorMoveCursorLeft(extend);  screenDirty = true; return;
+    case HID_KEY_RIGHT:     inputClearDeadKey(); editorMoveCursorRight(extend); screenDirty = true; return;
+    case HID_KEY_UP:        inputClearDeadKey(); editorMoveCursorUp(extend);    screenDirty = true; return;
+    case HID_KEY_DOWN:      inputClearDeadKey(); editorMoveCursorDown(extend);  screenDirty = true; return;
+    case HID_KEY_HOME:      inputClearDeadKey(); editorMoveCursorHome(extend);  screenDirty = true; return;
+    case HID_KEY_END:       inputClearDeadKey(); editorMoveCursorEnd(extend);   screenDirty = true; return;
     case HID_KEY_BACKSPACE: editorDeleteChar();      screenDirty = true; return;
     case HID_KEY_DELETE:    inputClearDeadKey(); editorDeleteForward();   screenDirty = true; return;
   }
