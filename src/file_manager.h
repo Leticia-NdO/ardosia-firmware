@@ -27,6 +27,18 @@ bool deriveUniqueFilename(const char* title, char* out, int maxLen);
 bool updateFileTitle(const char* filename, const char* newTitle);
 void deleteFile(const char* filename);
 
+// Delete the note the editor currently has open, and leave for the notes list.
+//
+// THE ORDER IS THE POINT, and it is why this is a function rather than four
+// lines at the call site. Autosave writes after ten seconds of idle, Esc saves
+// on the way out of the editor, and so does the power button's short press — so
+// a buffer still marked dirty with the filename still set puts the note back on
+// the card seconds after it was deleted. The editor is disarmed FIRST, and only
+// then does the file go.
+//
+// `selection` is the notes-list cursor, clamped once the list is shorter.
+void deleteOpenNote(int* selection);
+
 // Pick the /notes/ file for a book title. Appends to the latest file in the
 // slug series (title.txt, title_2.txt, …) unless that file is already at
 // NOTE_ROLLOVER_SIZE, in which case the next free name is used. `replace`
@@ -77,3 +89,8 @@ void noteIndexInvalidate();
 
 // Give a just-created note the next creation number. No-op if it already has one.
 void noteSeqAssignNew(const char* name);
+
+// Word count bookkeeping. The count lives in the sidecar next to the creation
+// order, so the browser can show it without opening a single note.
+void noteSeqSetWords(const char* name, uint32_t words);
+uint32_t noteSeqWordsOf(const char* name);

@@ -3,11 +3,15 @@
 #include <HalGPIO.h>
 #include <GfxRenderer.h>
 #include <esp_pm.h>
+#include <driver/adc.h>
 #include <esp_ota_ops.h>
 #include <esp_app_format.h>
 #include <Preferences.h>
 #include <RecoveryBoot.h>
 #include "sd_backup.h"
+#include "dpad.h"
+#include "confirm.h"
+#include "quickmenu.h"
 
 #include "config.h"
 #include "ble_keyboard.h"
@@ -33,6 +37,11 @@
 //  2. allowSleepAt — a grace window after boot, so the first refresh finishes
 //     before any hold can count.
 static constexpr unsigned long POWER_SLEEP_HOLD_MS = 400;   // was 3000
+
+// How long select has to be held to raise the quick menu. Between the power
+// button's 400ms and the Back button's 5s, and on the short side on purpose:
+// the tap it delays is the one that opens a note or types a newline.
+static constexpr unsigned long QUICK_MENU_HOLD_MS = 500;
 static constexpr unsigned long POWER_SHORT_PRESS_MIN_MS = 50;
 static constexpr unsigned long POWER_WAKE_GRACE_MS = 2000;
 static unsigned long allowSleepAt = 0;
@@ -85,7 +94,15 @@ static void dropLegacyDiagKeys() {
 UIState currentState = UIState::MAIN_MENU;
 int mainMenuSelection = 0;
 int selectedFileIndex = 0;
-int settingsSelection = 0;
+// Derived from the tab table rather than hard-coded to 0: the invariant the
+// Settings screen relies on is that settingsSelection is always a row of
+// settingsTab, and a 0 here would only happen to satisfy it for as long as the
+// first row of the first tab stayed SET_DARK_MODE.
+int settingsSelection = settingsTabRow(TAB_SYSTEM, 0);
+// Which Settings tab is open. RAM only, on purpose: it is worth keeping across
+// a visit and not worth a flash write, and a device that always opens Settings
+// on the same tab is easier to predict than one that remembers.
+int settingsTab = TAB_SYSTEM;
 NoteSort noteSort = NoteSort::ALPHA_ASC;
 int bluetoothDeviceSelection = 0;
 int pairedKeyboardSelection = 0;
@@ -100,9 +117,18 @@ int renameBufferLen = 0;
 // UI mode flags
 bool darkMode = false;
 bool cleanMode = false;
-bool deleteConfirmPending = false;
+// The confirmation box for destructive actions. Lives here with the rest of
+// the UI state; the screens read it, input_handler drives it, confirm.cpp holds
+// the decisions and is tested on the host.
+ConfirmDialog confirmDialog;
+
+// The quick menu, raised by holding select (or Ctrl+K). Same arrangement as the
+// dialog above: state here, decisions in quickmenu.cpp where they are testable.
+QuickMenu quickMenu;
 WritingMode writingMode = WritingMode::NORMAL;
 FontSize fontSize = FontSize::LARGE;
+EditorFont editorFont = EditorFont::SANS;
+DpadMode dpadMode = DpadMode::Fixed;
 bool showWordCount = true;
 // Defaults to ABNT2: this fork is written in Portuguese and pairs with a
 // Brazilian keyboard. Switchable in Settings (US / US-Intl / ABNT2).
@@ -126,6 +152,33 @@ static void registerOtaAppName(const char* name) {
   prefs.putString(key, name);
   prefs.end();
   DBG_PRINTF("[OTA] Registered as \"%s\" in slot %d\n", name, slot);
+}
+
+// Rename another app's menu entry. The name lives in the same shared NVS
+// namespace registerOtaAppName() writes to, keyed by the slot number — so the
+// other app reads it too, and a name set here survives reflashing this one.
+// Passing an empty name clears the override and the generic "OTA Slot N"
+// returns, which is the way back from a name you regret.
+bool renameOtaApp(int index, const char* name) {
+  if (index < 0 || index >= otaAppCount || name == nullptr) return false;
+  const int slot = otaApps[index].partitionSubtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
+  if (slot < 0 || slot > 15) return false;
+
+  char key[8];
+  snprintf(key, sizeof(key), "ota_%d", slot);
+  Preferences prefs;
+  prefs.begin("ota_names", false);
+  if (name[0] == '\0') prefs.remove(key);
+  else                  prefs.putString(key, name);
+  prefs.end();
+
+  if (name[0] == '\0') {
+    snprintf(otaApps[index].name, sizeof(otaApps[index].name), "OTA Slot %d", slot);
+  } else {
+    strncpy(otaApps[index].name, name, sizeof(otaApps[index].name) - 1);
+    otaApps[index].name[sizeof(otaApps[index].name) - 1] = '\0';
+  }
+  return true;
 }
 
 // Scan all OTA partitions (except self), check for valid firmware, populate otaApps[].
@@ -207,7 +260,7 @@ static void updateScreen() {
   {
     int sw = renderer.getScreenWidth();
     int textAreaWidth = sw - 20;  // 10px margins each side
-    int avgCharW = renderer.getTextAdvanceX(editorFontId(fontSize), "abcdefghijklmnopqrstuvwxyz") / 26;
+    int avgCharW = renderer.getTextAdvanceX(editorFontId(fontSize, editorFont), "abcdefghijklmnopqrstuvwxyz") / 26;
     if (avgCharW > 0) charsPerLine = textAreaWidth / avgCharW;
   }
   editorSetCharsPerLine(charsPerLine);
@@ -277,6 +330,10 @@ void setup() {
   darkMode = uiPrefs.getBool("darkMode", false);
   writingMode = static_cast<WritingMode>(uiPrefs.getUChar("writeMode", 0));
   fontSize = static_cast<FontSize>(uiPrefs.getUChar("fontSize", 2));
+  editorFont = static_cast<EditorFont>(uiPrefs.getUChar("editFont", 0));
+  if (static_cast<int>(editorFont) > 1) editorFont = EditorFont::SANS;
+  dpadMode = static_cast<DpadMode>(uiPrefs.getUChar("dpad", 0));
+  if (static_cast<int>(dpadMode) > 1) dpadMode = DpadMode::Fixed;
   showWordCount = uiPrefs.getBool("showWC", true);
   keyboardLayout = static_cast<KeyboardLayout>(
       uiPrefs.getUChar("kbLayout", static_cast<uint8_t>(KeyboardLayout::ABNT2)));
@@ -325,6 +382,8 @@ void setup() {
       int ss = jsonGetInt(uiBuf, "sleepScr");
       int sl = jsonGetInt(uiBuf, "sleepLight");
       int ns = jsonGetInt(uiBuf, "noteSort");
+      int ef = jsonGetInt(uiBuf, "editFont");
+      int dp = jsonGetInt(uiBuf, "dpad");
       if (o  >= 0) { uiPrefs.putUChar("orient",    (uint8_t)o);  currentOrientation = static_cast<Orientation>(o); }
       if (d  >= 0) { uiPrefs.putBool("darkMode",   d != 0);      darkMode           = (d != 0); }
       if (wm >= 0) { uiPrefs.putUChar("writeMode", (uint8_t)wm); writingMode        = static_cast<WritingMode>(wm); }
@@ -336,6 +395,14 @@ void setup() {
       if (ns >= 0 && ns <= 3) {
         uiPrefs.putUChar("noteSort", (uint8_t)ns);
         noteSort = static_cast<NoteSort>(ns);
+      }
+      if (ef >= 0 && ef <= 1) {
+        uiPrefs.putUChar("editFont", (uint8_t)ef);
+        editorFont = static_cast<EditorFont>(ef);
+      }
+      if (dp >= 0 && dp <= 1) {
+        uiPrefs.putUChar("dpad", (uint8_t)dp);
+        dpadMode = static_cast<DpadMode>(dp);
       }
       // Re-apply orientation in case it changed
       GfxRenderer::Orientation gfxOrient = GfxRenderer::Portrait;
@@ -404,6 +471,107 @@ void enterDeepSleep(SleepReason reason) {
 
 // Translate physical button presses to HID key codes
 // NOTE: gpio.update() is called in loop() before this function
+// --- Button ladder diagnostic — TEMPORARY -----------------------------------
+// The buttons are an ADC ladder, not digital lines (InputManager.cpp:57). The
+// channel that carries Up and Down decodes ANY value in 1121..3800 as Up — some
+// 65% of the ADC's range — because the ladder only has to tell Up (~2242) from
+// Down (~5) and from rest (~4095). So every transient that pin produces reads
+// as Up, and never as Down, which matches the reported symptom exactly.
+//
+// That is a mechanism, not a proof, and this repository has a history of the
+// obvious hypothesis being wrong. So: record what channel 2 actually does,
+// rather than guess. The readout appears in the Settings footer.
+//
+// Delete this block, buttonDiagText(), its call in drawSettingsMenu and the
+// counter bump below to remove the instrument.
+static constexpr bool BUTTON_DIAG = true;
+
+// ROUND 2. The first round refuted the obvious idea: at rest the channel sits
+// on 4095 and never wanders into the Up window, so nothing is drifting there on
+// its own. What the readings did show is that Down reads "4, 5, 6 or 4095"
+// while held — the contact is bouncing — and that is the lead:
+//
+//   to get from 5 (Down) back to 4095 (rest) the voltage has to cross
+//   1121..3800, and that IS the Up window.
+//
+// So every bounce of Down sweeps through Up, and boot does the same as the pin
+// charges from 0 to 4095. That would make the phantom Up not spontaneous at all
+// but a shadow of a Down — which fits "I could not catch it jumping by itself".
+//
+// This round records what the channel was doing AT the moment an Up event was
+// enqueued, and how low it had been just before. A real Up press should fire
+// around 2248 with nothing low behind it; a sweep should fire somewhere else
+// entirely with a ~5 in its recent past.
+static int adcCh2Now = -1;
+static uint16_t upEventsSent = 0;
+
+static constexpr int DIAG_RING = 16;   // ~160 ms of history at the active cadence
+static int diagRing[DIAG_RING];
+static int diagRingPos = 0;
+static bool diagRingFilled = false;
+
+static int upEventAdc = -1;      // channel value when the last Up event fired
+static int upEventPreMin = -1;   // lowest value in the samples just before it
+
+// Has an Up event ever fired with a Down in its recent past? That is the
+// signature of the sweep: the voltage climbing from ~5 back to 4095 crosses the
+// Up window on the way. An honest Up press has ~2248 behind it, never ~5.
+//
+// This is what keeps the instrument silent in daily use: it says nothing until
+// it has actually caught something, and only then takes the footer over. A
+// diagnostic that shouts every day stops being read.
+static bool diagSuspectSeen = false;
+
+static void buttonDiagSample() {
+  if (!BUTTON_DIAG) return;
+  const int v = adc1_get_raw(ADC1_CHANNEL_2);
+  adcCh2Now = v;
+  diagRing[diagRingPos] = v;
+  diagRingPos = (diagRingPos + 1) % DIAG_RING;
+  if (diagRingPos == 0) diagRingFilled = true;
+}
+
+// Called wherever an Up event is enqueued, so the evidence is captured at the
+// instant the event happens rather than whenever the screen next redraws.
+static void buttonDiagNoteUp() {
+  if (!BUTTON_DIAG) return;
+  upEventsSent++;
+  upEventAdc = adcCh2Now;
+  const int n = diagRingFilled ? DIAG_RING : diagRingPos;
+  int lowest = 9999;
+  for (int i = 0; i < n; i++) {
+    if (diagRing[i] < lowest) lowest = diagRing[i];
+  }
+  upEventPreMin = (n > 0) ? lowest : -1;
+  // 1120 is the top of the Down window in ADC_RANGES_2: anything at or below it
+  // was Down, not Up, so an Up event with that in its history is suspect.
+  if (n > 0 && lowest <= 1120) diagSuspectSeen = true;
+}
+
+bool buttonDiagSuspect() { return BUTTON_DIAG && diagSuspectSeen; }
+
+// Shown only once buttonDiagSuspect() is true.
+//   ev<count> @<value when it fired> pre<lowest just before>
+void buttonDiagUpText(char* out, size_t n) {
+  snprintf(out, n, "!up ev%u @%d pre%d", upEventsSent, upEventAdc, upEventPreMin);
+}
+
+// Raise the quick menu for whatever screen is up. Called from the button poll
+// rather than through the key queue: the gesture is a hold, which has no key to
+// stand for it, and inventing one would mean a keyboard could send it by
+// accident.
+static void openQuickMenuHere() {
+  if (currentState == UIState::FILE_BROWSER) {
+    if (noteVisibleCount() > 0) {
+      quickOpen(quickMenu, QuickKind::Note, selectedFileIndex);
+      screenDirty = true;
+    }
+  } else if (currentState == UIState::TEXT_EDITOR) {
+    quickOpen(quickMenu, QuickKind::Editor, -1);
+    screenDirty = true;
+  }
+}
+
 static void processPhysicalButtons() {
   static bool btnUpLast = false;
   static bool btnDownLast = false;
@@ -420,6 +588,28 @@ static void processPhysicalButtons() {
   bool btnRight   = gpio.isPressed(HalGPIO::BTN_RIGHT);
   bool btnConfirm = gpio.isPressed(HalGPIO::BTN_CONFIRM);
   bool btnBack    = gpio.isPressed(HalGPIO::BTN_BACK);
+
+  buttonDiagSample();
+
+  // First call after boot: adopt whatever the buttons are doing as the baseline
+  // instead of comparing against a `false` that was never observed. Without
+  // this, a button already down at the first poll — a settling ADC, or simply
+  // booting with Up held — reads as a rising edge and fires a press nobody made.
+  //
+  // Seeding rather than returning early: the power state machine below has to
+  // see this poll too, or the release that arms `powerReleasedSinceWake` can be
+  // the one we skipped. With Last == current, no edge fires this time round and
+  // everything else runs normally.
+  static bool baselineTaken = false;
+  if (!baselineTaken) {
+    baselineTaken = true;
+    btnUpLast = btnUp;
+    btnDownLast = btnDown;
+    btnLeftLast = btnLeft;
+    btnRightLast = btnRight;
+    btnConfirmLast = btnConfirm;
+    btnBackLast = btnBack;
+  }
 
   // Power button state machine for proper long/short press handling
   static bool powerHeld = false;
@@ -505,33 +695,105 @@ static void processPhysicalButtons() {
     backHeld = false;
   }
 
+  // Rotate once, here, instead of in every screen below. The old code carried
+  // `|| btnRight` in six blocks — a landscape patch that is right in one
+  // landscape and wrong in the other, and that left Left and Right doing double
+  // duty everywhere.
+  //
+  // Edges are taken on the PHYSICAL buttons and only then rotated. Rotating the
+  // held state instead and remembering it in logical space would manufacture an
+  // edge the moment the orientation changed, which is exactly the phantom-press
+  // shape this input path has already been bitten by once.
+  const bool physEdge[4] = {btnUp && !btnUpLast, btnDown && !btnDownLast,
+                            btnLeft && !btnLeftLast, btnRight && !btnRightLast};
+  const bool physHeld[4] = {btnUp, btnDown, btnLeft, btnRight};
+
+  bool dirEdge[4] = {false, false, false, false};
+  bool dirHeld[4] = {false, false, false, false};
+  for (int i = 0; i < 4; i++) {
+    const Dir to = dpadResolve(static_cast<Dir>(i), currentOrientation, dpadMode);
+    const int j = static_cast<int>(to);
+    if (physEdge[i]) dirEdge[j] = true;
+    if (physHeld[i]) dirHeld[j] = true;
+  }
+
+  // In Fixed mode Left and Right double as Down and Up on list screens, which is
+  // the behaviour that shipped and the muscle memory that exists. In Natural
+  // mode each button already points somewhere definite, so the alias would take
+  // a direction away.
+  const bool aliasing = (dpadMode == DpadMode::Fixed);
+  const bool navUpEdge =
+      dirEdge[(int)Dir::Up] || (aliasing && dirEdge[(int)Dir::Right]);
+  const bool navDownEdge =
+      dirEdge[(int)Dir::Down] || (aliasing && dirEdge[(int)Dir::Left]);
+
+  // The select button carries two gestures on the two screens that have a quick
+  // menu: a tap is Enter, a hold raises the menu. So a tap has to fire on
+  // RELEASE there — firing it on the press would open the note first and then
+  // the menu on top of it.
+  //
+  // Everywhere else it still fires on the press. The delay is small but real,
+  // and those screens have nothing to trade it for.
+  //
+  // Same shape as the power button, and for the same reason: a gesture that
+  // arms on a hold needs the release to decide what the press meant. The menu
+  // being open disarms the hold, so select inside the menu is an ordinary
+  // immediate Enter.
+  static bool confirmHeld = false;
+  static unsigned long confirmPressStart = 0;
+  static bool confirmLongFired = false;
+
+  const bool quickGesture = (currentState == UIState::FILE_BROWSER ||
+                             currentState == UIState::TEXT_EDITOR) &&
+                            !quickMenu.open() && !confirmDialog.open();
+
+  bool confirmShort = false;
+  if (btnConfirm && !btnConfirmLast) {
+    confirmHeld = true;
+    confirmPressStart = millis();
+    confirmLongFired = false;
+    if (!quickGesture) confirmShort = true;
+  }
+  if (btnConfirm && confirmHeld && !confirmLongFired && quickGesture &&
+      millis() - confirmPressStart >= QUICK_MENU_HOLD_MS) {
+    confirmLongFired = true;
+    openQuickMenuHere();
+  }
+  if (!btnConfirm && confirmHeld) {
+    confirmHeld = false;
+    // A hold that already fired must not also send an Enter on the way up.
+    if (quickGesture && !confirmLongFired) confirmShort = true;
+  }
+
   // Map physical buttons to HID key codes based on current UI state
   switch (currentState) {
     case UIState::MAIN_MENU:
-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
+      if (navUpEdge) {
+        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
+      if (navDownEdge) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
       }
-      if (btnConfirm && !btnConfirmLast) {
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
       break;
 
     case UIState::FILE_BROWSER:
-      if (((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) && getFileCount() > 0) {
+      if (navUpEdge && getFileCount() > 0) {
+        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
-      if (((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) && getFileCount() > 0) {
+      if (navDownEdge && getFileCount() > 0) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
       }
-      if (btnConfirm && !btnConfirmLast && getFileCount() > 0) {
+      if (confirmShort && getFileCount() > 0) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
@@ -556,10 +818,10 @@ static void processPhysicalButtons() {
 
       // Map currently held button to HID key (0 = none)
       uint8_t heldKey = 0;
-      if      (btnUp)    heldKey = HID_KEY_UP;
-      else if (btnDown)  heldKey = HID_KEY_DOWN;
-      else if (btnLeft)  heldKey = HID_KEY_LEFT;
-      else if (btnRight) heldKey = HID_KEY_RIGHT;
+      if      (dirHeld[(int)Dir::Up])    heldKey = HID_KEY_UP;
+      else if (dirHeld[(int)Dir::Down])  heldKey = HID_KEY_DOWN;
+      else if (dirHeld[(int)Dir::Left])  heldKey = HID_KEY_LEFT;
+      else if (dirHeld[(int)Dir::Right]) heldKey = HID_KEY_RIGHT;
 
       if (heldKey != repeatKey) {
         // Key changed — fire immediately on press
@@ -575,21 +837,30 @@ static void processPhysicalButtons() {
         }
       }
 
-      if (btnConfirm && !btnConfirmLast) {
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
       if (btnBack && !btnBackLast) {
-        if (editorHasUnsavedChanges()) saveCurrentFile();
-        currentState = UIState::FILE_BROWSER;
-        screenDirty = true;
+        // Back leaves the editor by changing state here rather than through the
+        // key queue, so with a box up it would walk out from under it — saving
+        // the note the box was asking about deleting. With one open it becomes
+        // the box's own way out instead.
+        if (quickMenu.open() || confirmDialog.open()) {
+          enqueueKeyEvent(HID_KEY_ESCAPE, 0, true);
+          enqueueKeyEvent(HID_KEY_ESCAPE, 0, false);
+        } else {
+          if (editorHasUnsavedChanges()) saveCurrentFile();
+          currentState = UIState::FILE_BROWSER;
+          screenDirty = true;
+        }
       }
       break;
     }
 
     case UIState::RENAME_FILE:
     case UIState::NEW_FILE:
-      if (btnConfirm && !btnConfirmLast) {
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
@@ -600,23 +871,28 @@ static void processPhysicalButtons() {
       break;
 
     case UIState::BLUETOOTH_SETTINGS:
-      if (btnUp && !btnUpLast) {
+      // Left and Right mean Disconnect and Scan here, so this screen has no
+      // alias either. Up and Down were left on the RAW buttons when the
+      // rotation went in — one axis rotated and the other not, which in Natural
+      // landscape had the two pairs obeying different rules on the same screen.
+      if (dirEdge[(int)Dir::Up]) {
+        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
-      if (btnDown && !btnDownLast) {
+      if (dirEdge[(int)Dir::Down]) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
       }
-      if (btnRight && !btnRightLast) {
+      if (dirEdge[(int)Dir::Right]) {
         enqueueKeyEvent(HID_KEY_RIGHT, 0, true);  // Scan
         enqueueKeyEvent(HID_KEY_RIGHT, 0, false);
       }
-      if (btnLeft && !btnLeftLast) {
+      if (dirEdge[(int)Dir::Left]) {
         enqueueKeyEvent(HID_KEY_LEFT, 0, true);   // Disconnect
         enqueueKeyEvent(HID_KEY_LEFT, 0, false);
       }
-      if (btnConfirm && !btnConfirmLast) {
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
@@ -627,15 +903,16 @@ static void processPhysicalButtons() {
       break;
 
     case UIState::PAIRED_KEYBOARDS:
-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
+      if (navUpEdge) {
+        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
+      if (navDownEdge) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
       }
-      if (btnConfirm && !btnConfirmLast) {
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
@@ -646,15 +923,16 @@ static void processPhysicalButtons() {
       break;
 
     case UIState::WIFI_SYNC:
-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
+      if (navUpEdge) {
+        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
+      if (navDownEdge) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
       }
-      if (btnConfirm && !btnConfirmLast) {
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
@@ -665,15 +943,28 @@ static void processPhysicalButtons() {
       break;
 
     case UIState::SETTINGS:
-      if ((btnUp && !btnUpLast) || (btnRight && !btnRightLast)) {
+      // The one list screen WITHOUT the Left/Right-as-Up/Down alias: since
+      // Settings grew tabs it has two axes, and the alias would spend the
+      // horizontal one. Up/Down walk the rows, Left/Right the tabs — and both
+      // pairs come from dirEdge, so they follow the screen in Natural mode.
+      if (dirEdge[(int)Dir::Up]) {
+        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
-      if ((btnDown && !btnDownLast) || (btnLeft && !btnLeftLast)) {
+      if (dirEdge[(int)Dir::Down]) {
         enqueueKeyEvent(HID_KEY_DOWN, 0, true);
         enqueueKeyEvent(HID_KEY_DOWN, 0, false);
       }
-      if (btnConfirm && !btnConfirmLast) {
+      if (dirEdge[(int)Dir::Left]) {
+        enqueueKeyEvent(HID_KEY_LEFT, 0, true);
+        enqueueKeyEvent(HID_KEY_LEFT, 0, false);
+      }
+      if (dirEdge[(int)Dir::Right]) {
+        enqueueKeyEvent(HID_KEY_RIGHT, 0, true);
+        enqueueKeyEvent(HID_KEY_RIGHT, 0, false);
+      }
+      if (confirmShort) {
         enqueueKeyEvent(HID_KEY_ENTER, 0, true);
         enqueueKeyEvent(HID_KEY_ENTER, 0, false);
       }
@@ -716,15 +1007,15 @@ void drawStatusPopup(const char* msg) {
   renderer.clearScreen();
   const int sw = renderer.getScreenWidth();
   const int sh = renderer.getScreenHeight();
-  const int tw = renderer.getTextAdvanceX(FONT_BODY, msg);
-  const int th = renderer.getLineHeight(FONT_BODY);
+  const int tw = renderer.getTextAdvanceX(FONT_CHROME_XL, msg);
+  const int th = renderer.getLineHeight(FONT_CHROME_XL);
   const int w = tw + 48;
   const int h = th + 28;
   const int x = (sw - w) / 2;
   const int y = sh / 2 - h / 2;
   renderer.fillRect(x - 3, y - 3, w + 6, h + 6, true);
   renderer.fillRect(x, y, w, h, false);
-  renderer.drawText(FONT_BODY, x + 24, y + 8, msg, true, EpdFontFamily::BOLD);
+  renderer.drawText(FONT_CHROME_XL, x + 24, y + 8, msg, true, EpdFontFamily::BOLD);
   renderer.displayBuffer(HalDisplay::HALF_REFRESH);
 }
 
@@ -750,26 +1041,31 @@ void renderSleepScreen() {
   int sw = renderer.getScreenWidth();
   int sh = renderer.getScreenHeight();
 
+  // The sleep card is chrome, not note text, so it follows the chrome face.
+  // Same ink-matched mapping as ui_renderer.cpp: L for what was notosans 14,
+  // M for notosans 12, S for ubuntu 10. The x here is recomputed from the
+  // measured width, so the wider monospace stays centred on its own.
+
   // Title: "Ardosia"
   const char* title = "Ardosia";
-  int titleWidth = renderer.getTextAdvanceX(FONT_BODY, title);
+  int titleWidth = renderer.getTextAdvanceX(FONT_CHROME_XL, title);
   int titleX = (sw - titleWidth) / 2;
   int titleY = sh * 0.35; // 35% down the screen (moved up)
-  renderer.drawText(FONT_BODY, titleX, titleY, title, true, EpdFontFamily::BOLD);
+  renderer.drawText(FONT_CHROME_XL, titleX, titleY, title, true, EpdFontFamily::BOLD);
 
   // Subtitle: "Asleep"
   const char* subtitle = "Asleep";
-  int subTitleWidth = renderer.getTextAdvanceX(FONT_UI, subtitle);
+  int subTitleWidth = renderer.getTextAdvanceX(FONT_CHROME_L, subtitle);
   int subTitleX = (sw - subTitleWidth) / 2;
   int subTitleY = sh * 0.48; // 48% down the screen (moved up)
-  renderer.drawText(FONT_UI, subTitleX, subTitleY, subtitle, true);
+  renderer.drawText(FONT_CHROME_L, subTitleX, subTitleY, subtitle, true);
 
   // Footer: "Hold Power to wake"
   const char* footer = "Hold Power to wake";
-  int footerWidth = renderer.getTextAdvanceX(FONT_SMALL, footer);
+  int footerWidth = renderer.getTextAdvanceX(FONT_CHROME_S, footer);
   int footerX = (sw - footerWidth) / 2;
   int footerY = sh * 0.75; // 75% down the screen (moved up from bottom)
-  renderer.drawText(FONT_SMALL, footerX, footerY, footer);
+  renderer.drawText(FONT_CHROME_S, footerX, footerY, footer);
 
   // Perform a full display refresh to ensure the sleep screen is visible
   renderer.displayBuffer(HalDisplay::FULL_REFRESH);
@@ -797,6 +1093,14 @@ void loop() {
     if (lastState == UIState::BLUETOOTH_SETTINGS && isDeviceScanning()) {
       stopDeviceScan();
     }
+  }
+  // A dialog belongs to the screen that raised it. The power button's short
+  // press changes state without going through the key path, so without this a
+  // "Delete this note?" would still be pending behind the main menu and would
+  // reappear — armed — the next time the notes list was opened.
+  if (currentState != lastState) {
+    confirmClose(confirmDialog);
+    quickClose(quickMenu);
   }
   lastState = currentState;
 
@@ -865,13 +1169,17 @@ void loop() {
   static SleepScreenMode lastSavedSleepScreen = sleepScreenMode;
   static SleepBrightness lastSavedSleepBrightness = sleepBrightness;
   static NoteSort lastSavedNoteSort = noteSort;
+  static EditorFont lastSavedEditorFont = editorFont;
+  static DpadMode lastSavedDpadMode = dpadMode;
   if (currentOrientation != lastSavedOrientation || darkMode != lastSavedDarkMode
       || writingMode != lastSavedWritingMode || fontSize != lastSavedFontSize
       || showWordCount != lastSavedShowWordCount
       || keyboardLayout != lastSavedKeyboardLayout
       || sleepScreenMode != lastSavedSleepScreen
       || sleepBrightness != lastSavedSleepBrightness
-      || noteSort != lastSavedNoteSort) {
+      || noteSort != lastSavedNoteSort
+      || editorFont != lastSavedEditorFont
+      || dpadMode != lastSavedDpadMode) {
     uiPrefs.putUChar("orient", static_cast<uint8_t>(currentOrientation));
     uiPrefs.putBool("darkMode", darkMode);
     uiPrefs.putUChar("writeMode", static_cast<uint8_t>(writingMode));
@@ -881,6 +1189,8 @@ void loop() {
     uiPrefs.putUChar("sleepScr", static_cast<uint8_t>(sleepScreenMode));
     uiPrefs.putUChar("sleepLight", static_cast<uint8_t>(sleepBrightness));
     uiPrefs.putUChar("noteSort", static_cast<uint8_t>(noteSort));
+    uiPrefs.putUChar("editFont", static_cast<uint8_t>(editorFont));
+    uiPrefs.putUChar("dpad", static_cast<uint8_t>(dpadMode));
     lastSavedOrientation = currentOrientation;
     lastSavedDarkMode = darkMode;
     lastSavedWritingMode = writingMode;
@@ -890,16 +1200,18 @@ void loop() {
     lastSavedSleepScreen = sleepScreenMode;
     lastSavedSleepBrightness = sleepBrightness;
     lastSavedNoteSort = noteSort;
+    lastSavedEditorFont = editorFont;
+    lastSavedDpadMode = dpadMode;
     // Keep SD backup in sync so settings survive a firmware flash
     static char uiBuf[256];
     snprintf(uiBuf, sizeof(uiBuf),
              "{\"orient\":%d,\"dark\":%d,\"writeMode\":%d,\"fontSize\":%d,"
              "\"showWC\":%d,\"kbLayout\":%d,\"sleepScr\":%d,\"sleepLight\":%d,"
-             "\"noteSort\":%d}",
+             "\"noteSort\":%d,\"editFont\":%d,\"dpad\":%d}",
              (int)currentOrientation, darkMode ? 1 : 0,
              (int)writingMode, (int)fontSize, showWordCount ? 1 : 0,
              (int)keyboardLayout, (int)sleepScreenMode, (int)sleepBrightness,
-             (int)noteSort);
+             (int)noteSort, (int)editorFont, (int)dpadMode);
     sdEnsureBackupDir();
     sdWriteFile("/ardosia/ui_prefs.json", uiBuf);
   }

@@ -32,3 +32,8 @@ void inputDescribeLastKey(char* buf, size_t n);
 // it inside the cursor so the pending state is visible on a slow e-ink screen.
 uint32_t inputGetPendingDeadKey();
 void inputClearDeadKey();
+
+// Header for the title-edit screen: it edits a note title or an OTA app's menu
+// entry, and says which.
+const char* renameScreenTitle();
+bool renameTargetIsApp();

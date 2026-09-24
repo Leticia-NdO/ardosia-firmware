@@ -23,7 +23,7 @@ customisable sleep screens.
 - **Dark Mode** — inverted display
 - **Display Orientation** — portrait, landscape, and inverted variants
 - **Power Management** — ESP-IDF light sleep between loop iterations (CPU drops to 10MHz), BLE modem sleep keeps the radio alive, SD card sleeps between accesses, display analog circuits power down after each refresh, and the device enters deep sleep after 5 minutes of inactivity
-- **WiFi Sync** — one-button backup of all notes to your PC over WiFi. Saves network credentials for instant reconnect. Read-only server — nothing on the device can be modified over the network
+- **WiFi Sync** — *the Sync entry is currently hidden from the main menu; Hotspot is not. See the WiFi Sync section.* One-button backup of all notes to your PC over WiFi. Saves network credentials for instant reconnect. The device runs an HTTP server and the PC pulls from it; downloads are read-only, but a `POST /notes` route can append to a note while sync or the hotspot is up
 - **Standalone Build** — all libraries are bundled in the repo; no sibling projects required
 - **Dual-Boot** — optional combined firmware that includes CrossPoint (an e-reader) in a second OTA slot. A "CrossPoint" entry appears in the main menu; selecting it reboots into the reader. CrossPoint gains a reciprocal "Ardosia" entry. Both apps work normally when flashed standalone.
 - **Settings Backup** — BLE pairing info, WiFi credentials, and UI preferences are backed up to the SD card as JSON files. They are silently restored after a firmware flash so you don't need to re-pair your keyboard or re-enter WiFi passwords.
@@ -84,9 +84,24 @@ The device remembers paired keyboards (up to 4) and reconnects automatically on 
 |-----|--------|
 | Up / Down | Navigate |
 | Left / Right | Also navigate (convenient in landscape) |
+| 1 – 9, 0 | Move the selector to that numbered entry; 0 is the tenth (keyboard only) |
+| Ctrl+N | Rename the entry (dual-boot apps only) |
 | Enter | Select |
 
-Options: **Browse Notes**, **New Note**, **Settings**, **Sync** — and **CrossPoint** if the dual-boot firmware is installed
+Options: **Browse Notes**, **New Note**, **Settings**, **Hotspot** — and **CrossPoint** if the dual-boot firmware is installed
+
+**Sync** is built but hidden from the menu for now (`MENU_SHOW_SYNC` in `src/config.h`). It is listed last when shown, so toggling it never renumbers the entries above.
+
+A dual-boot entry can be renamed: select it and press **Ctrl+N**. The name is
+kept in shared NVS keyed by OTA slot, so the other app reads the same name and
+it survives reflashing this one. Confirming an **empty** name clears the
+override and the generic `OTA Slot N` comes back — that is the way out of a name
+you regret. Names are cut to 31 bytes, on a character boundary.
+
+Each entry is numbered on screen (`[3]  Settings`). Typing its digit on a
+connected BLE keyboard moves the selector there and stops — it does not open
+the entry. Press Enter to do that. Some entries are one-way — CrossPoint reboots
+into the reader — so a mistyped digit should not be able to commit to one.
 
 ### File Browser
 
@@ -97,9 +112,31 @@ Options: **Browse Notes**, **New Note**, **Settings**, **Sync** — and **CrossP
 | Enter | Open note |
 | Ctrl+N | Edit title of selected note |
 | Ctrl+D | Delete selected note (confirmation required) |
+| Ctrl+K, or **hold select** | Quick menu for the selected note |
 | Esc | Back to main menu |
 
-When delete is pending, the footer shows `Delete? Enter:Yes  Esc:No`. Press Enter to confirm or any other key to cancel.
+Each note shows its word count on the right. The count is recorded when the note
+is saved and kept in the card's note index, so opening the browser never has to
+read the notes themselves. A note that has not been saved since the count
+existed — one restored from a backup, or posted over sync — shows **—** until
+the next time it is saved.
+
+**Holding the select button** for half a second on a note opens a quick menu —
+Rename, Delete, Cancel. It exists because the two actions above are Ctrl chords
+and the case has no Ctrl key: without a keyboard there was no way to rename or
+delete a note at all.
+
+Because the button now carries two gestures, a *tap* fires when you let go
+rather than when you press. On this screen and in the editor only.
+
+Deleting asks first. A box opens over the list naming the note, with **Cancel**
+and **Delete** — and it opens on Cancel, so pressing Enter again destroys
+nothing. Left/Up and Right/Down move between the two buttons, Enter chooses,
+Esc cancels. While the box is up it is the only thing that sees a key: typing
+does not go on filtering the list underneath it, and no stray key dismisses it.
+
+It deletes the note it named when it opened, not whatever the selector happens
+to be on by then.
 
 ### Text Editor
 
@@ -115,7 +152,35 @@ When delete is pending, the footer shows `Delete? Enter:Yes  Esc:No`. Press Ente
 | Ctrl+T | Toggle Typewriter mode |
 | Ctrl+P | Toggle Pagination mode |
 | Ctrl+Left / Right | Jump pages (Pagination mode only) |
+| Ctrl+K, or **hold select** | Quick menu |
 | Esc / Back button | Save and return to file browser |
+
+**Hold the select button** for half a second (or press Ctrl+K) to open the quick
+menu over the page:
+
+| Row | What it does |
+|-----|--------------|
+| Font Size | Small → Medium → Large |
+| Typeface | Sans / Mono |
+| Dark Mode | Light / Dark |
+| Writing Mode | Normal → Typewriter → Pagination |
+| Rename | Opens the title editor |
+| Delete | Deletes this note — asks first |
+| Cancel | |
+
+The four at the top show their current value and **leave the menu open**, so you
+can cycle a setting and see what it landed on; the page is behind the box, and
+the row is the only place the new value is legible. The bottom three close it.
+
+This is the only way to reach any of that without a keyboard — every editor
+shortcut is a Ctrl chord, and the case has no Ctrl key. It is also the only
+place that shows what the font, mode and theme currently *are*: the chords
+change them blind.
+
+Deleting the open note clears the editor before it removes the file. That order
+matters — auto-save runs on a 10-second idle and both Esc and the power button
+save on the way out, so a note deleted with the buffer still armed would write
+itself straight back onto the card.
 
 The current writing mode is shown in the header: **[S]** Scroll, **[T]** Typewriter, **[P]** Pagination.
 
@@ -142,15 +207,83 @@ Accessed via Ctrl+N from the file browser or editor.
 
 ### Settings
 
-Navigate with all four direction buttons (or Up/Down on keyboard). Press Enter (or confirm button) to cycle through a setting's values. On a keyboard, Left/Right also cycle values backward/forward.
+Settings is in three tabs — **System**, **Editor**, **Controls**.
+
+| Key | Action |
+|-----|--------|
+| Up / Down | Move between the rows of the open tab |
+| Left / Right | Previous / next tab |
+| F1 / F2 / F3 | Straight to System / Editor / Controls |
+| Tab | Next tab |
+| Enter | Change the selected setting |
+| Shift+Enter | Change it the other way |
+| 1–9 | Jump to that row **of the open tab**, without changing it |
+| Esc | Back to the main menu |
+
+This is **the one list screen where Left and Right do not double as Up and
+Down.** The screen has two axes now and the case has four direction buttons and
+no modifier key, so the arrows are the only way to reach the tabs without a
+keyboard. Stepping a value backward moved to Shift+Enter.
+
+Moving to a tab always lands on its first row — the same key lands in the same
+place every time, rather than wherever you left that tab.
+
+Tabs paid for two things at once. No tab holds more than four rows, so nothing
+scrolls in landscape any more; and the digits restart inside each tab, so
+**every** row has a number again — the flat list had eleven rows against ten
+digits, and D-Pad Keys had to go without one.
+
+In portrait the three tabs are within a pixel of filling the width, so the bar
+measures itself and tightens its padding there. It never drops a tab.
+
+#### System
 
 | Setting | Values |
 |---------|--------|
-| Orientation | Portrait, Landscape CW, Inverted, Landscape CCW |
 | Dark Mode | Light / Dark |
+| Orientation | Portrait, Landscape CW, Inverted, Landscape CCW |
+| Sleep Screen | Text, Slideshow, Shuffle |
+
+Dark Mode is here rather than under Editor because it inverts every screen, not
+just the page you type on.
+
+#### Editor
+
+| Setting | Values |
+|---------|--------|
+| Editor Font | Sans / Mono — the typeface of the note body only; menus are always monospace |
+| Font Size | Small, Medium, Large |
 | Writing Mode | Normal, Typewriter, Pagination |
+| Note Order | A-Z, Z-A, Newest, Oldest |
+
+Font Size and Writing Mode sit below Editor Font despite being adjusted more,
+because **Ctrl+F**, **Ctrl+T** and **Ctrl+P** already reach them from the editor
+— Settings is their fallback, not their front door. Note Order orders the notes
+list rather than the editor; it is here because writing is what it belongs to,
+and three rows do not justify a fourth tab.
+
+#### Controls
+
+| Setting | Values |
+|---------|--------|
 | Bluetooth | Opens Bluetooth scan to pair a new keyboard |
 | Paired Keyboards | Manage saved keyboards (connect, forget, disconnect) |
+| Keyboard | US, US-Intl, ABNT2 |
+| D-Pad Keys | Standard / Natural — see below |
+
+**D-Pad Keys** decides what the four direction buttons mean once the screen is
+rotated. **Standard** is the original behaviour: a button means what is printed
+on it, and on list screens Right also scrolls up and Left also scrolls down.
+**Natural** rotates them with the screen, so the button that *points* up the
+page is the one that scrolls up. In portrait the two are identical.
+
+Natural is set for the case held with its **bottom edge to the right** and the
+side keys above — verified on the device, not derived. If you hold it the other
+way round, the two landscape cases in `src/dpad.cpp` are what to exchange; the
+file says so at the top.
+
+Switching **Editor Font** re-wraps the text: monospace gives every character the
+widest slot, so fewer characters fit on a line at the same Font Size.
 
 All settings persist across reboots.
 
@@ -162,9 +295,13 @@ Shows all keyboards saved on the device (up to 4). The currently active keyboard
 |-----|--------|
 | Up / Down | Navigate list |
 | Enter | Switch to selected keyboard |
-| D | Forget selected keyboard (removes pairing) |
+| D | Forget selected keyboard — asks first |
 | Left | Disconnect selected keyboard (if currently active) |
 | Esc | Back to Settings |
+
+Forgetting asks before it acts, in the same box the notes list uses, opened on
+Cancel. It used to happen on the spot, on a bare letter key — on the one screen
+you are on *because* the keyboard is already misbehaving.
 
 To pair a second keyboard, go to **Settings → Bluetooth**, scan, and connect. Both keyboards will then appear in the Paired Keyboards list. On each boot the device tries the last-used keyboard first, then works through the rest of the list until one connects.
 
@@ -182,7 +319,20 @@ A scan runs for 5 seconds and then stops. Up to 10 nearby devices are shown with
 
 ### WiFi Sync
 
+> **The Sync entry is hidden for now**, switched off by `MENU_SHOW_SYNC` in
+> `src/config.h`; set it back to `true` to bring it back. **Hotspot is not
+> hidden** — it is still on the menu. Everything below still describes how the
+> feature works: the firmware side is built and unchanged, only the Sync menu
+> row is unreachable.
+
 Back up all notes from the device to your PC over WiFi. The device and PC must be on the **same WiFi network**.
+
+The direction is the opposite of what "sync" usually suggests: **the device is
+the server and the PC pulls from it.** The device raises WiFi, announces itself
+as `ardosia.local` over mDNS and serves `GET /api/files` and
+`GET /notes/<name>`; `sync/ardosia_sync.py` polls for it, downloads anything it
+does not already have, then `POST /api/sync-complete` tells the device to shut
+the radio off.
 
 #### One-time PC setup
 
@@ -191,24 +341,28 @@ Back up all notes from the device to your PC over WiFi. The device and PC must b
    ```bash
    pip install requests
    ```
-3. Run the installer for your platform:
+3. Set the download folder. `LOCAL_DIR` at the top of `sync/ardosia_sync.py`
+   defaults to `~/OneDrive/Documents/Ardosia Notes`, which only makes sense on a
+   Windows machine with OneDrive. Point it wherever you want the notes.
+4. Register auto-start:
 
-**Windows** — double-click **`sync\install_sync.bat`**
+**Windows** — double-click **`sync\install_sync.bat`**. The script starts
+immediately and runs silently in the background on every login. To stop
+auto-start later, double-click **`sync\uninstall_sync.bat`**.
 
-**macOS / Linux** — run in a terminal:
+**macOS / Linux** — there is no installer yet. Run the script yourself:
 ```bash
-chmod +x sync/install_sync.sh && sync/install_sync.sh
+python3 sync/ardosia_sync.py
 ```
+It polls for the device every 5 seconds and keeps running, so start it before
+you press Sync on the device.
 
-That's it. The script starts immediately and will run silently in the background on every login. When a sync completes, a desktop notification lists the files that were downloaded (Windows balloon, macOS notification, or Linux `notify-send`). Notes are saved to `Documents/Ardosia Notes/` by default (edit `LOCAL_DIR` in `ardosia_sync.py` to change).
-
-To stop auto-start later:
-- **Windows** — double-click **`sync\uninstall_sync.bat`**
-- **macOS / Linux** — run `sync/uninstall_sync.sh`
+When a sync completes, a desktop notification lists the files that were
+downloaded (Windows balloon, macOS notification, or Linux `notify-send`).
 
 #### Syncing
 
-1. Select **Sync** from the main menu on the device
+1. Select **Sync** from the main menu on the device (with `MENU_SHOW_SYNC` on)
 2. **First time:** pick your WiFi network and enter the password. The device asks to save credentials.
 3. **After that:** the device auto-connects — just press Sync and wait
 4. The device syncs automatically once connected — a progress log is shown on screen
@@ -258,9 +412,7 @@ ardosia-firmware/
 ├── sync/
 │   ├── ardosia_sync.py      — PC sync script (Python, cross-platform)
 │   ├── install_sync.bat     — register auto-start on Windows login
-│   ├── uninstall_sync.bat   — remove auto-start on Windows
-│   ├── install_sync.sh      — register auto-start on macOS / Linux
-│   └── uninstall_sync.sh    — remove auto-start on macOS / Linux
+│   └── uninstall_sync.bat   — remove auto-start on Windows
 ├── lib/                  — all hardware/display libraries (bundled)
 │   ├── GfxRenderer/
 │   ├── EpdFont/

@@ -6,6 +6,9 @@
 #include "utf8_util.h"
 #include "deadkeys.h"
 #include "keymap.h"
+#include "dpad.h"
+#include "confirm.h"
+#include "quickmenu.h"
 
 #include <Arduino.h>
 #include <SDCardManager.h>
@@ -15,9 +18,12 @@
 extern bool autoReconnectEnabled;
 extern bool darkMode;
 extern bool cleanMode;
-extern bool deleteConfirmPending;
+extern ConfirmDialog confirmDialog;
+extern QuickMenu quickMenu;
 extern WritingMode writingMode;
 extern FontSize fontSize;
+extern EditorFont editorFont;
+extern DpadMode dpadMode;
 extern bool showWordCount;
 
 // External functions
@@ -62,8 +68,21 @@ void inputGetLastKey(uint8_t* hid, uint8_t* mods) {
 // Where to return after title edit is confirmed or cancelled
 static UIState renameReturnState = UIState::FILE_BROWSER;
 
+// What the title editor is editing. This used to be inferred from
+// renameReturnState, which held up while there were exactly two callers and
+// stopped the moment a third arrived — renaming an OTA app also returns to the
+// main menu, so the return state no longer identifies the target.
+enum class RenameTarget : uint8_t { NoteTitle, OtaAppName };
+static RenameTarget renameTarget = RenameTarget::NoteTitle;
+static int renameOtaIndex = -1;
+
+bool renameOtaApp(int index, const char* name);
+
 // Forward declaration
-static void openTitleEdit(const char* currentTitle, UIState returnTo);
+static void openTitleEdit(const char* currentTitle, UIState returnTo,
+                          RenameTarget target = RenameTarget::NoteTitle,
+                          int otaIndex = -1);
+static void quickMenuAct(QuickItem item, int index);
 
 // OTA app detection (defined in main.cpp)
 extern OtaAppEntry otaApps[];
@@ -75,6 +94,7 @@ extern UIState currentState;
 extern int mainMenuSelection;
 extern int selectedFileIndex;
 extern int settingsSelection;
+extern int settingsTab;
 extern NoteSort noteSort;
 extern int bluetoothDeviceSelection;
 extern int pairedKeyboardSelection;
@@ -161,6 +181,21 @@ void inputDescribeLastKey(char* buf, const size_t n) {
 
 // Handle text editor input
 static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
+  // Both boxes are modal, and both are up over live text: a key that fell
+  // through here would be typed into the note behind them.
+  if (quickMenu.open()) {
+    const QuickResult r = quickKey(quickMenu, keyCode, modifiers);
+    if (r.reply == QuickReply::Chosen) quickMenuAct(r.item, quickMenu.index);
+    if (r.reply != QuickReply::Swallowed) screenDirty = true;
+    return;
+  }
+  if (confirmDialog.open()) {
+    const ConfirmReply reply = confirmKey(confirmDialog, keyCode, modifiers);
+    if (reply == ConfirmReply::Confirmed) deleteOpenNote(&selectedFileIndex);
+    if (reply != ConfirmReply::Swallowed) screenDirty = true;
+    return;
+  }
+
   // Ctrl shortcuts
   if (isCtrl(modifiers)) {
     if (keyCode == HID_KEY_S) {
@@ -170,6 +205,14 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
     }
     if (keyCode == HID_KEY_Z) {
       cleanMode = !cleanMode;
+      screenDirty = true;
+      return;
+    }
+    if (keyCode == HID_KEY_K) {
+      // The same menu holding select raises. Worth having from the keyboard
+      // too: it is the one place that shows what the font, the mode and the
+      // theme currently ARE — every chord below changes a value blind.
+      quickOpen(quickMenu, QuickKind::Editor, -1);
       screenDirty = true;
       return;
     }
@@ -297,8 +340,17 @@ static void handleEditorKey(uint8_t keyCode, uint8_t modifiers) {
 }
 
 // Open the title edit screen, returning to `returnTo` on confirm/cancel
-static void openTitleEdit(const char* currentTitle, UIState returnTo) {
+const char* renameScreenTitle() {
+  return renameTarget == RenameTarget::OtaAppName ? "Rename App" : "Edit Title";
+}
+
+bool renameTargetIsApp() { return renameTarget == RenameTarget::OtaAppName; }
+
+static void openTitleEdit(const char* currentTitle, UIState returnTo,
+                          RenameTarget target, int otaIndex) {
   inputClearDeadKey();
+  renameTarget = target;
+  renameOtaIndex = otaIndex;
   strncpy(renameBuffer, currentTitle, MAX_TITLE_LEN - 1);
   renameBuffer[MAX_TITLE_LEN - 1] = '\0';
   utf8TrimPartialTail(renameBuffer);
@@ -314,6 +366,23 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
     inputClearDeadKey();
   }
   if (keyCode == HID_KEY_ENTER) {
+    if (renameTarget == RenameTarget::OtaAppName) {
+      // An empty name is allowed here, unlike a note title: it clears the
+      // override and brings the generic "OTA Slot N" back.
+      //
+      // OtaAppEntry::name holds 32 bytes against the title buffer's 40, so a
+      // long name is cut — on a character boundary, not mid-sequence, or a
+      // trailing "ç" would become a stray byte in NVS and on the menu.
+      char appName[32];
+      strncpy(appName, renameBuffer, sizeof(appName) - 1);
+      appName[sizeof(appName) - 1] = '\0';
+      utf8TrimPartialTail(appName);
+      if (!renameOtaApp(renameOtaIndex, appName)) return;
+      renameTarget = RenameTarget::NoteTitle;
+      currentState = renameReturnState;
+      screenDirty = true;
+      return;
+    }
     if (renameBufferLen > 0) {
       if (renameReturnState == UIState::TEXT_EDITOR) {
         if (editorGetCurrentFile()[0] == '\0') {
@@ -347,6 +416,7 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
   }
 
   if (keyCode == HID_KEY_ESCAPE) {
+    renameTarget = RenameTarget::NoteTitle;
     currentState = renameReturnState;
     screenDirty = true;
     return;
@@ -384,6 +454,64 @@ static void handleRenameKey(uint8_t keyCode, uint8_t modifiers) {
   }
 }
 
+// Moving to a tab parks the selector on its first row, rather than remembering
+// where the tab was left. Predictable beats clever on a screen you are on
+// because you are hunting for something: the same key always lands in the same
+// place. It also keeps the invariant the Settings case relies on —
+// settingsSelection is always a row of settingsTab.
+// What the quick menu's rows actually do. The menu itself only knows which rows
+// exist and which one is selected; everything that touches the device is here.
+// `index` is the notes-list row the menu was raised on, passed in because the
+// menu has already closed itself by the time the closing items get here — the
+// captured row has to outlive the box that captured it.
+static void quickMenuAct(QuickItem item, int index) {
+  switch (item) {
+    case QuickItem::FontSize:
+      fontSize = static_cast<FontSize>((static_cast<int>(fontSize) + 1) % 3);
+      break;
+    case QuickItem::Typeface:
+      editorFont = (editorFont == EditorFont::SANS) ? EditorFont::MONO
+                                                    : EditorFont::SANS;
+      break;
+    case QuickItem::DarkMode:
+      darkMode = !darkMode;
+      break;
+    case QuickItem::WritingMode:
+      writingMode = static_cast<WritingMode>((static_cast<int>(writingMode) + 1) % 3);
+      break;
+
+    case QuickItem::Rename:
+      if (currentState == UIState::TEXT_EDITOR) {
+        openTitleEdit(editorGetCurrentTitle(), UIState::TEXT_EDITOR);
+      } else {
+        FileInfo* note = noteVisibleAt(index);
+        if (note) openTitleEdit(note->title, UIState::FILE_BROWSER);
+      }
+      break;
+
+    case QuickItem::Delete:
+      // Hands straight over to the confirmation box — the quick menu never
+      // destroys anything itself, so there is exactly one place that asks and
+      // exactly one place that deletes.
+      if (currentState == UIState::TEXT_EDITOR) {
+        if (editorGetCurrentFile()[0] != '\0') {
+          confirmOpen(confirmDialog, ConfirmKind::DeleteOpenNote, -1);
+        }
+      } else {
+        confirmOpen(confirmDialog, ConfirmKind::DeleteNote, index);
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+static void settingsGotoTab(int tab) {
+  settingsTab = ((tab % SETTINGS_TAB_COUNT) + SETTINGS_TAB_COUNT) % SETTINGS_TAB_COUNT;
+  settingsSelection = settingsTabRow(settingsTab, 0);
+}
+
 static void dispatchEvent(const KeyEvent& event) {
   if (!event.pressed) return;
 
@@ -399,6 +527,16 @@ static void dispatchEvent(const KeyEvent& event) {
       } else if (event.keyCode == HID_KEY_UP) {
         mainMenuSelection = (mainMenuSelection - 1 + menuCount) % menuCount;
         screenDirty = true;
+      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_N) {
+        // Ctrl+N renames the entry, echoing the browser's Ctrl+N for a note
+        // title. Only the OTA rows have a name of their own to change.
+        if (mainMenuSelection >= BASE_MENU_COUNT) {
+          const int idx = mainMenuSelection - BASE_MENU_COUNT;
+          if (idx < otaAppCount) {
+            openTitleEdit(otaApps[idx].name, UIState::MAIN_MENU,
+                          RenameTarget::OtaAppName, idx);
+          }
+        }
       } else if (event.keyCode == HID_KEY_ENTER) {
         if (mainMenuSelection == MENU_BROWSE) {
           refreshFileList();
@@ -421,6 +559,17 @@ static void dispatchEvent(const KeyEvent& event) {
         } else if (mainMenuSelection >= BASE_MENU_COUNT) {
           switchToOtaApp(mainMenuSelection - BASE_MENU_COUNT);
         }
+      } else {
+        // Digit shortcut: move the selector to that row and stop there. It
+        // does NOT activate the row — the user still presses Enter. Several
+        // of these entries are one-way (Sync brings up the radio, an OTA
+        // entry reboots into another app), and on a screen that takes a
+        // moment to redraw a mistyped digit must not be able to commit to one.
+        const int row = menuDigit(event.keyCode, event.modifiers);
+        if (row >= 1 && row <= menuCount) {
+          mainMenuSelection = row - 1;
+          screenDirty = true;
+        }
       }
       break;
     }
@@ -428,24 +577,47 @@ static void dispatchEvent(const KeyEvent& event) {
     case UIState::FILE_BROWSER: {
       int fc = noteVisibleCount();
 
-      // Delete confirmation pending — Enter confirms, anything else cancels
-      if (deleteConfirmPending) {
-        if (event.keyCode == HID_KEY_ENTER && fc > 0) {
-          FileInfo* note = noteVisibleAt(selectedFileIndex);
-          if (note) deleteFile(note->filename);
-          noteClampSelection(&selectedFileIndex);
-        }
-        deleteConfirmPending = false;
-        screenDirty = true;
+      // The quick menu goes first. The two are never up together — choosing
+      // Delete in the menu closes it and raises the box — so the order is for
+      // the reader, not for correctness.
+      if (quickMenu.open()) {
+        const int raisedOn = quickMenu.index;
+        const QuickResult r = quickKey(quickMenu, event.keyCode, event.modifiers);
+        if (r.reply == QuickReply::Chosen) quickMenuAct(r.item, raisedOn);
+        if (r.reply != QuickReply::Swallowed) screenDirty = true;
         break;
       }
 
-      if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_N) {
+      // The confirmation box is modal: while it is up nothing else on this
+      // screen sees a key. It deletes the note it captured when it opened, not
+      // whatever the selection happens to point at by then.
+      if (confirmDialog.open()) {
+        const ConfirmReply reply = confirmKey(confirmDialog, event.keyCode, event.modifiers);
+        if (reply == ConfirmReply::Confirmed) {
+          FileInfo* note = noteVisibleAt(confirmDialog.index);
+          if (note) deleteFile(note->filename);
+          noteClampSelection(&selectedFileIndex);
+        }
+        // A swallowed key changed nothing on screen, and a redraw costs a
+        // panel refresh — so it does not get one.
+        if (reply != ConfirmReply::Swallowed) screenDirty = true;
+        break;
+      }
+
+      if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_K) {
+        // The same menu the select button raises on a hold. Redundant here —
+        // Ctrl+N and Ctrl+D already do both of its actions — but the gesture
+        // should mean the same thing on both screens.
+        if (fc > 0) {
+          quickOpen(quickMenu, QuickKind::Note, selectedFileIndex);
+          screenDirty = true;
+        }
+      } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_N) {
         FileInfo* note = noteVisibleAt(selectedFileIndex);
         if (note) openTitleEdit(note->title, UIState::FILE_BROWSER);
       } else if (isCtrl(event.modifiers) && event.keyCode == HID_KEY_D) {
         if (fc > 0) {
-          deleteConfirmPending = true;
+          confirmOpen(confirmDialog, ConfirmKind::DeleteNote, selectedFileIndex);
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_DOWN && fc > 0) {
@@ -494,76 +666,100 @@ static void dispatchEvent(const KeyEvent& event) {
       break;
 
     case UIState::SETTINGS: {
-      // Orientation, Dark Mode, Writing Mode, Font Size, Keyboard, Sleep Screen,
-      // Note Order, Bluetooth, Paired Keyboards
-      const int SETTINGS_COUNT = 9;
+      // Two axes now: Up/Down walks the rows of the open tab, Left/Right walks
+      // the tabs. That costs Left its old job of stepping a value backward,
+      // which moves to Shift+Enter — the physical case has four direction
+      // buttons and no modifier key, so the tabs have to be reachable from the
+      // arrows or they are not reachable at all without a keyboard.
+      const int rowCount = settingsTabRowCount(settingsTab);
+      const SettingsPlace here = settingsPlaceOf(settingsSelection);
+      const int pos = here.pos >= 0 ? here.pos : 0;
 
-      // Up/Down: navigate settings list (physical buttons also map here)
       if (event.keyCode == HID_KEY_DOWN) {
-        settingsSelection = (settingsSelection + 1) % SETTINGS_COUNT;
+        settingsSelection = settingsTabRow(settingsTab, (pos + 1) % rowCount);
         screenDirty = true;
       } else if (event.keyCode == HID_KEY_UP) {
-        settingsSelection = (settingsSelection - 1 + SETTINGS_COUNT) % SETTINGS_COUNT;
+        settingsSelection =
+            settingsTabRow(settingsTab, (pos - 1 + rowCount) % rowCount);
         screenDirty = true;
 
-      // Enter or Right: cycle setting forward
-      } else if (event.keyCode == HID_KEY_ENTER || event.keyCode == HID_KEY_RIGHT) {
-        if (settingsSelection == 0) {
-          int v = static_cast<int>(currentOrientation);
-          currentOrientation = static_cast<Orientation>((v + 1) % 4);
-        } else if (settingsSelection == 1) {
+      // Tabs: the arrows, the function keys the design draws on them, and Tab.
+      } else if (event.keyCode == HID_KEY_RIGHT || event.keyCode == HID_KEY_TAB) {
+        settingsGotoTab(settingsTab + 1);
+        screenDirty = true;
+      } else if (event.keyCode == HID_KEY_LEFT) {
+        settingsGotoTab(settingsTab - 1);
+        screenDirty = true;
+      } else if (event.keyCode == HID_KEY_F1) {
+        settingsGotoTab(TAB_SYSTEM);
+        screenDirty = true;
+      } else if (event.keyCode == HID_KEY_F2) {
+        settingsGotoTab(TAB_EDITOR);
+        screenDirty = true;
+      } else if (event.keyCode == HID_KEY_F3) {
+        settingsGotoTab(TAB_CONTROLS);
+        screenDirty = true;
+
+      // Enter changes the row's value; Shift+Enter walks it back.
+      //
+      // Forward and backward used to be two separate if-chains, one per key,
+      // and a row added to only one of them would have cycled in one direction
+      // and stuck in the other — the same failure mode as a parallel array.
+      // One chain with a step cannot do that.
+      } else if (event.keyCode == HID_KEY_ENTER) {
+        const int step = isShift(event.modifiers) ? -1 : 1;
+        auto cyc = [step](int v, int n) { return ((v + step) % n + n) % n; };
+
+        if (settingsSelection == SET_ORIENTATION) {
+          currentOrientation =
+              static_cast<Orientation>(cyc(static_cast<int>(currentOrientation), 4));
+        } else if (settingsSelection == SET_DARK_MODE) {
           darkMode = !darkMode;
-        } else if (settingsSelection == 2) {
-          int v = static_cast<int>(writingMode);
-          writingMode = static_cast<WritingMode>((v + 1) % 3);
-        } else if (settingsSelection == 3) {
-          int v = static_cast<int>(fontSize);
-          fontSize = static_cast<FontSize>((v + 1) % 3);
-        } else if (settingsSelection == 4) {
-          keyboardLayout = static_cast<KeyboardLayout>(
-              (static_cast<int>(keyboardLayout) + 1) % 3);
+        } else if (settingsSelection == SET_WRITING) {
+          writingMode = static_cast<WritingMode>(cyc(static_cast<int>(writingMode), 3));
+        } else if (settingsSelection == SET_FONT_SIZE) {
+          fontSize = static_cast<FontSize>(cyc(static_cast<int>(fontSize), 3));
+        } else if (settingsSelection == SET_EDITOR_FONT) {
+          editorFont = (editorFont == EditorFont::SANS) ? EditorFont::MONO
+                                                        : EditorFont::SANS;
+        } else if (settingsSelection == SET_KEYBOARD) {
+          keyboardLayout =
+              static_cast<KeyboardLayout>(cyc(static_cast<int>(keyboardLayout), 3));
           inputClearDeadKey();   // don't carry an armed accent across the switch
-        } else if (settingsSelection == 5) {
-          sleepScreenMode = static_cast<SleepScreenMode>(
-              (static_cast<int>(sleepScreenMode) + 1) % 3);
-        } else if (settingsSelection == 6) {
-          noteSort = static_cast<NoteSort>((static_cast<int>(noteSort) + 1) % 4);
-        } else if (settingsSelection == 7) {
+        } else if (settingsSelection == SET_SLEEP) {
+          sleepScreenMode =
+              static_cast<SleepScreenMode>(cyc(static_cast<int>(sleepScreenMode), 3));
+        } else if (settingsSelection == SET_NOTE_ORDER) {
+          noteSort = static_cast<NoteSort>(cyc(static_cast<int>(noteSort), 4));
+        } else if (settingsSelection == SET_BLUETOOTH) {
           currentState = UIState::BLUETOOTH_SETTINGS;
-        } else if (settingsSelection == 8) {
+        } else if (settingsSelection == SET_PAIRED_KB) {
           pairedKeyboardSelection = 0;
           currentState = UIState::PAIRED_KEYBOARDS;
-        }
-        screenDirty = true;
-
-      // Left: cycle setting backward (keyboard only — physical L/R map to Up/Down)
-      } else if (event.keyCode == HID_KEY_LEFT) {
-        if (settingsSelection == 0) {
-          int v = static_cast<int>(currentOrientation);
-          currentOrientation = static_cast<Orientation>((v - 1 + 4) % 4);
-        } else if (settingsSelection == 1) {
-          darkMode = !darkMode;
-        } else if (settingsSelection == 2) {
-          int v = static_cast<int>(writingMode);
-          writingMode = static_cast<WritingMode>((v - 1 + 3) % 3);
-        } else if (settingsSelection == 3) {
-          int v = static_cast<int>(fontSize);
-          fontSize = static_cast<FontSize>((v - 1 + 3) % 3);
-        } else if (settingsSelection == 4) {
-          keyboardLayout = static_cast<KeyboardLayout>(
-              (static_cast<int>(keyboardLayout) + 2) % 3);
-          inputClearDeadKey();
-        } else if (settingsSelection == 5) {
-          sleepScreenMode = static_cast<SleepScreenMode>(
-              (static_cast<int>(sleepScreenMode) + 2) % 3);
-        } else if (settingsSelection == 6) {
-          noteSort = static_cast<NoteSort>((static_cast<int>(noteSort) + 3) % 4);
+        } else if (settingsSelection == SET_DPAD) {
+          dpadMode = (dpadMode == DpadMode::Fixed) ? DpadMode::Natural
+                                                   : DpadMode::Fixed;
         }
         screenDirty = true;
 
       } else if (event.keyCode == HID_KEY_ESCAPE) {
         currentState = UIState::MAIN_MENU;
         screenDirty = true;
+
+      } else {
+        // Digit shortcut: park the selector on that row without changing its
+        // value. Enter still does the change — here that matters twice over,
+        // since these rows cycle a setting in place rather than opening
+        // something, so a digit that also acted would silently rotate a value.
+        //
+        // The digits count rows WITHIN the open tab, which is what the screen
+        // draws beside them. Tabs are what gave the eleventh row its number
+        // back: no tab is longer than the digits.
+        const int row = menuDigit(event.keyCode, event.modifiers);
+        if (row >= 1 && row <= rowCount) {
+          settingsSelection = settingsTabRow(settingsTab, row - 1);
+          screenDirty = true;
+        }
       }
       break;
     }
@@ -621,6 +817,18 @@ static void dispatchEvent(const KeyEvent& event) {
     case UIState::PAIRED_KEYBOARDS: {
       int count = getPairedKeyboardCount();
 
+      if (confirmDialog.open()) {
+        const ConfirmReply reply = confirmKey(confirmDialog, event.keyCode, event.modifiers);
+        if (reply == ConfirmReply::Confirmed) {
+          removePairedKeyboard(confirmDialog.index);
+          const int newCount = getPairedKeyboardCount();
+          if (pairedKeyboardSelection >= newCount)
+            pairedKeyboardSelection = newCount > 0 ? newCount - 1 : 0;
+        }
+        if (reply != ConfirmReply::Swallowed) screenDirty = true;
+        break;
+      }
+
       if (event.keyCode == HID_KEY_ESCAPE) {
         currentState = UIState::SETTINGS;
         screenDirty = true;
@@ -642,10 +850,7 @@ static void dispatchEvent(const KeyEvent& event) {
         }
       } else if (event.keyCode == HID_KEY_D) {
         if (count > 0) {
-          removePairedKeyboard(pairedKeyboardSelection);
-          int newCount = getPairedKeyboardCount();
-          if (pairedKeyboardSelection >= newCount && newCount > 0)
-            pairedKeyboardSelection = newCount - 1;
+          confirmOpen(confirmDialog, ConfirmKind::ForgetKeyboard, pairedKeyboardSelection);
           screenDirty = true;
         }
       } else if (event.keyCode == HID_KEY_LEFT) {

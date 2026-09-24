@@ -57,6 +57,8 @@ FsFile SDCardManager::open(const char* path, oflag_t oflag) {
     it = nodes.find(p);
   }
 
+  if (wantWrite) opensForWrite++;
+
   f.path = p;
   f.valid_ = true;
   f.dir_ = it->second.isDir;
@@ -87,7 +89,8 @@ bool SDCardManager::rename(const char* path, const char* newPath) {
   return true;
 }
 
-void SDCardManager::testReset() { nodes.clear(); }
+void SDCardManager::testReset() {
+  opensForWrite = 0; nodes.clear(); }
 
 void SDCardManager::testSetCreateDate(const char* path, uint16_t date, uint16_t time) {
   auto it = nodes.find(norm(path));

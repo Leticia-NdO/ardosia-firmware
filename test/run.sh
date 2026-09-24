@@ -40,4 +40,29 @@ $CXX $FLAGS -o /tmp/ardosia_test_sleep \
     test_sleep.cpp ../src/sleep_layout.cpp
 /tmp/ardosia_test_sleep || status=1
 
+echo
+$CXX $FLAGS -o /tmp/ardosia_test_menu \
+    test_menu.cpp ../src/keymap.cpp
+/tmp/ardosia_test_menu || status=1
+
+echo
+$CXX $FLAGS -o /tmp/ardosia_test_ui_layout \
+    test_ui_layout.cpp ../src/ui_layout.cpp
+/tmp/ardosia_test_ui_layout || status=1
+
+echo
+$CXX $FLAGS -o /tmp/ardosia_test_dpad \
+    test_dpad.cpp ../src/dpad.cpp
+/tmp/ardosia_test_dpad || status=1
+
+echo
+$CXX $FLAGS -o /tmp/ardosia_test_confirm \
+    test_confirm.cpp ../src/confirm.cpp
+/tmp/ardosia_test_confirm || status=1
+
+echo
+$CXX $FLAGS -o /tmp/ardosia_test_quickmenu \
+    test_quickmenu.cpp ../src/quickmenu.cpp
+/tmp/ardosia_test_quickmenu || status=1
+
 exit $status

@@ -16,10 +16,25 @@ extern NoteSort noteSort;
 
 // Creation order. The FAT clock is not trustworthy, so each note gets a
 // monotonic number the first time we see it. Newest is the highest number.
+//
+// `words` rides along because the browser needs it and reading every note to
+// count would mean opening up to MAX_FILES files, each up to 16 KB, every time
+// the list is refreshed — on a card the code deliberately puts back to sleep.
+// The editor already knows the count when it saves, so the number is written
+// once and read back with the rest of the sidecar.
 struct NoteSeqEntry {
   char name[MAX_FILENAME_LEN];
   uint32_t seq;
+  uint32_t words;
 };
+
+// This struct is written to the card as raw bytes, so its layout IS the file
+// format. Both sizes are asserted rather than trusted: a change to
+// MAX_FILENAME_LEN or a compiler that pads differently would otherwise corrupt
+// every sidecar on every card silently.
+static constexpr size_t NOTE_SEQ_V1_ENTRY = MAX_FILENAME_LEN + sizeof(uint32_t);
+static_assert(sizeof(NoteSeqEntry) == NOTE_SEQ_V1_ENTRY + sizeof(uint32_t),
+              "NoteSeqEntry gained padding; the on-disk format would shift");
 static NoteSeqEntry noteSeq[MAX_FILES];
 static int noteSeqCount = 0;
 static uint32_t noteSeqNext = 1;
@@ -31,6 +46,10 @@ static int visibleCount = 0;
 
 static constexpr uint32_t NOTE_SEQ_MAGIC = 0x4E534551;  // 'NSEQ'
 static constexpr char NOTE_SEQ_PATH[] = "/.ardosia/note_seq.bin";
+// v1 records were name + seq. v2 appends the word count. A v1 file is still
+// read — dropping it would throw away every note's creation order, which is
+// what Note Order: Newest/Oldest sorts by, and there is no way to recover it.
+static constexpr uint8_t NOTE_SEQ_VERSION = 2;
 
 // Shared state
 extern UIState currentState;
@@ -258,7 +277,7 @@ static void noteSeqSave() {
   auto file = SdMan.open(NOTE_SEQ_PATH, O_WRONLY | O_CREAT | O_TRUNC);
   if (!file) return;
   const uint32_t magic = NOTE_SEQ_MAGIC;
-  const uint8_t version = 1;
+  const uint8_t version = NOTE_SEQ_VERSION;
   const uint8_t pad[3] = {0, 0, 0};
   const uint16_t count = static_cast<uint16_t>(noteSeqCount);
   const uint16_t pad2 = 0;
@@ -286,7 +305,7 @@ static void noteSeqLoad() {
   uint16_t count = 0;
   uint16_t pad2 = 0;
   bool ok = file.read(&magic, sizeof(magic)) == (int)sizeof(magic) && magic == NOTE_SEQ_MAGIC &&
-            file.read(&version, 1) == 1 && version == 1 &&
+            file.read(&version, 1) == 1 && (version == 1 || version == NOTE_SEQ_VERSION) &&
             file.read(pad, sizeof(pad)) == (int)sizeof(pad) &&
             file.read(&noteSeqNext, sizeof(noteSeqNext)) == (int)sizeof(noteSeqNext) &&
             file.read(&count, sizeof(count)) == (int)sizeof(count) &&
@@ -297,9 +316,19 @@ static void noteSeqLoad() {
     noteSeqNext = 1;
     return;
   }
-  if (count > 0) {
-    const int n = file.read(noteSeq, sizeof(NoteSeqEntry) * count);
-    if (n != (int)(sizeof(NoteSeqEntry) * count)) {
+  for (int i = 0; i < count; i++) {
+    // v2 records read straight into the struct. v1 records are the same bytes
+    // minus the trailing count, so they are read field by field and the count
+    // is marked unknown — not zero, which would claim every old note is empty.
+    bool got;
+    if (version == NOTE_SEQ_VERSION) {
+      got = file.read(&noteSeq[i], sizeof(NoteSeqEntry)) == (int)sizeof(NoteSeqEntry);
+    } else {
+      got = file.read(noteSeq[i].name, MAX_FILENAME_LEN) == MAX_FILENAME_LEN &&
+            file.read(&noteSeq[i].seq, sizeof(uint32_t)) == (int)sizeof(uint32_t);
+      noteSeq[i].words = NOTE_WORDS_UNKNOWN;
+    }
+    if (!got) {
       file.close();
       noteSeqCount = 0;
       noteSeqNext = 1;
@@ -308,6 +337,7 @@ static void noteSeqLoad() {
   }
   file.close();
   noteSeqCount = count;
+  // A v1 file has been upgraded in memory; the next save writes it back as v2.
 }
 
 static void noteSeqEnsure() {
@@ -353,6 +383,7 @@ static void noteSeqAssignMissing(const uint32_t* fatKeys) {
       strncpy(noteSeq[i].name, fileList[i].filename, MAX_FILENAME_LEN - 1);
       noteSeq[i].name[MAX_FILENAME_LEN - 1] = '\0';
       noteSeq[i].seq = seqs[i];
+      noteSeq[i].words = NOTE_WORDS_UNKNOWN;   // counted on this note's first save
       fileList[i].modTime = seqs[i];
     }
     noteSeqCount = fileCount;
@@ -367,6 +398,7 @@ static void noteSeqAssignMissing(const uint32_t* fatKeys) {
     strncpy(noteSeq[noteSeqCount].name, fileList[i].filename, MAX_FILENAME_LEN - 1);
     noteSeq[noteSeqCount].name[MAX_FILENAME_LEN - 1] = '\0';
     noteSeq[noteSeqCount].seq = noteSeqNext++;
+    noteSeq[noteSeqCount].words = NOTE_WORDS_UNKNOWN;
     fileList[i].modTime = noteSeq[noteSeqCount].seq;
     noteSeqCount++;
   }
@@ -410,6 +442,7 @@ void refreshFileList() {
       fatKeys[fileCount] = fatKeyOf(file);
       const int slot = noteSeqFind(fileList[fileCount].filename);
       fileList[fileCount].modTime = slot >= 0 ? noteSeq[slot].seq : 0;
+      fileList[fileCount].words = slot >= 0 ? noteSeq[slot].words : NOTE_WORDS_UNKNOWN;
       fileCount++;
     }
     file.close();
@@ -520,8 +553,29 @@ void noteSeqAssignNew(const char* name) {
   strncpy(noteSeq[noteSeqCount].name, name, MAX_FILENAME_LEN - 1);
   noteSeq[noteSeqCount].name[MAX_FILENAME_LEN - 1] = '\0';
   noteSeq[noteSeqCount].seq = noteSeqNext++;
+  noteSeq[noteSeqCount].words = NOTE_WORDS_UNKNOWN;
   noteSeqCount++;
   noteSeqSave();
+}
+
+// Records a note's word count, writing the sidecar only when the number has
+// actually moved. Without that guard every autosave — one per ten idle seconds
+// — would rewrite the whole index to the card for nothing.
+void noteSeqSetWords(const char* name, uint32_t words) {
+  if (name == nullptr || name[0] == '\0') return;
+  noteSeqEnsure();
+  const int slot = noteSeqFind(name);
+  if (slot < 0) return;
+  if (noteSeq[slot].words == words) return;
+  noteSeq[slot].words = words;
+  noteSeqSave();
+}
+
+uint32_t noteSeqWordsOf(const char* name) {
+  if (name == nullptr || name[0] == '\0') return NOTE_WORDS_UNKNOWN;
+  noteSeqEnsure();
+  const int slot = noteSeqFind(name);
+  return slot >= 0 ? noteSeq[slot].words : NOTE_WORDS_UNKNOWN;
 }
 
 static void noteSeqRename(const char* from, const char* to) {
@@ -588,6 +642,10 @@ void saveCurrentFile(bool refreshList) {
   SdMan.rename(tmpPath, path);
   if (creating) noteSeqAssignNew(filename);
 
+  // The editor already has the count; the browser would otherwise have to open
+  // every note to get it.
+  noteSeqSetWords(filename, static_cast<uint32_t>(editorGetWordCount()));
+
   editorSetUnsavedChanges(false);
   if (refreshList) refreshFileList();
   SdMan.sleep();
@@ -635,6 +693,26 @@ void deleteFile(const char* filename) {
   refreshFileList();
   SdMan.sleep();
   DBG_PRINTF("Deleted: %s\n", filename);
+}
+
+void deleteOpenNote(int* selection) {
+  // Copy the name out before anything is cleared — editorGetCurrentFile()
+  // points at the editor's own storage, which the next line empties.
+  char doomed[MAX_FILENAME_LEN];
+  strncpy(doomed, editorGetCurrentFile(), sizeof(doomed) - 1);
+  doomed[sizeof(doomed) - 1] = '\0';
+
+  // Disarm first. editorClear() drops the unsaved flag with the text, and the
+  // empty filename is what makes saveCurrentFile() a no-op from here on, so
+  // neither the autosave nor the save-on-exit can write the note back.
+  editorClear();
+  editorSetCurrentFile("");
+  editorSetCurrentTitle("");
+
+  if (doomed[0] != '\0') deleteFile(doomed);
+
+  currentState = UIState::FILE_BROWSER;
+  if (selection) noteClampSelection(selection);
 }
 
 bool noteFilenameIsSafe(const char* filename) {

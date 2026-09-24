@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <vector>
+#include <utility>
 
 static int failures = 0;
 static int checks = 0;
@@ -244,6 +246,66 @@ static void testResolveNoteFilename() {
   check(noteAppendPrefixNewlines("\n", 1) == 1, "file that is just a newline");
 }
 
+// Deleting the note that is OPEN is the one sequence in this firmware that can
+// undo itself: the autosave fires on a ten-second idle, Esc saves on the way
+// out of the editor, and so does the power button — so a buffer still marked
+// dirty with the filename still set writes the note straight back onto the card
+// seconds after it was deleted. deleteOpenNote() disarms the editor before it
+// removes anything, and this is what proves the order.
+static void testDeleteOpenNote() {
+  printf("deleteOpenNote: the note does not come back\n");
+  resetFs();
+
+  SdMan.testAddFile("/notes/keeper.txt", "keep me");
+  SdMan.testAddFile("/notes/doomed.txt", "delete me");
+  refreshFileList();
+
+  loadFile("doomed.txt");
+  check(currentState == UIState::TEXT_EDITOR, "(the note is open)");
+  checkStr(editorGetCurrentFile(), "doomed.txt", "(and it is the open file)");
+
+  // Typing into it: this is the state that makes the trap real — an unsaved
+  // buffer whose next save would recreate the file.
+  editorInsertCodepoint('x');
+  check(editorHasUnsavedChanges(), "(with unsaved changes)");
+
+  int selection = 1;
+  deleteOpenNote(&selection);
+
+  check(!SdMan.exists("/notes/doomed.txt"), "the file is gone");
+  check(SdMan.exists("/notes/keeper.txt"), "and the other note is not");
+  check(!editorHasUnsavedChanges(), "the editor has nothing left to save");
+  checkStr(editorGetCurrentFile(), "", "and no file to save it to");
+  checkStr(editorGetCurrentTitle(), "", "nor a title to rebuild one from");
+  check(editorGetLength() == 0, "the buffer is empty");
+  check(currentState == UIState::FILE_BROWSER, "and we are back in the list");
+  check(selection >= 0 && selection < noteVisibleCount(),
+        "the list cursor is clamped to the shorter list");
+
+  // THE assertion. Every path out of the editor ends in one of these two, and
+  // neither may put the note back.
+  saveCurrentFile(false);
+  check(!SdMan.exists("/notes/doomed.txt"), "an explicit save does not recreate it");
+  saveCurrentFile(true);
+  check(!SdMan.exists("/notes/doomed.txt"), "and neither does one with a refresh");
+  check(noteVisibleCount() == 1, "the list holds only the surviving note");
+
+  // A deleted note must not leave a row behind in the card's index either.
+  SdMan.testAddFile("/notes/doomed.txt", "a different note, same name");
+  noteIndexInvalidate();
+  refreshFileList();
+  check(noteVisibleCount() == 2, "(a new note with the old name)");
+
+  // And with no note open at all it is a no-op rather than a crash or a delete
+  // of something arbitrary: the editor has no filename to hand it.
+  editorClear();
+  editorSetCurrentFile("");
+  const int before = noteVisibleCount();
+  deleteOpenNote(&selection);
+  refreshFileList();
+  check(noteVisibleCount() == before, "with no note open, nothing is deleted");
+}
+
 static void testLoadFileGuard() {
   printf("loadFile 16 KB guard\n");
   resetFs();
@@ -364,6 +426,197 @@ static void testSearchAndSort() {
   noteSort = NoteSort::ALPHA_ASC;
 }
 
+// ---------------------------------------------------------------------------
+// The note-order sidecar, /.ardosia/note_seq.bin
+//
+// This is the one structure Ardosia writes to the card in its own binary
+// format, so the format IS the compatibility surface. v2 appended a word count
+// to each record; a v1 file has to keep working, because the sequence numbers
+// in it are the only record of creation order and Note Order: Newest/Oldest
+// sorts by nothing else.
+// ---------------------------------------------------------------------------
+
+static void putLE32(std::string& b, uint32_t v) {
+  for (int i = 0; i < 4; i++) b.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+}
+static void putLE16(std::string& b, uint16_t v) {
+  for (int i = 0; i < 2; i++) b.push_back(static_cast<char>((v >> (8 * i)) & 0xFF));
+}
+
+// Builds a sidecar by hand, exactly as an older firmware would have written it.
+static std::string buildSidecar(uint8_t version, uint32_t next,
+                                const std::vector<std::pair<std::string, uint32_t>>& entries) {
+  std::string b;
+  putLE32(b, 0x4E534551);                     // 'NSEQ'
+  b.push_back(static_cast<char>(version));
+  b.append(3, '\0');                          // pad
+  putLE32(b, next);
+  putLE16(b, static_cast<uint16_t>(entries.size()));
+  putLE16(b, 0);                              // pad2
+  for (const auto& e : entries) {
+    std::string name = e.first;
+    name.resize(MAX_FILENAME_LEN, '\0');
+    b.append(name);
+    putLE32(b, e.second);
+    if (version >= 2) putLE32(b, NOTE_WORDS_UNKNOWN);
+  }
+  return b;
+}
+
+static void testSidecarV1IsStillRead() {
+  printf("sidecar: a v1 file keeps its creation order\n");
+  resetFs();
+  SdMan.testAddFile("/notes/alpha.txt", "one two three");
+  SdMan.testAddFile("/notes/beta.txt", "four five");
+  // beta was created FIRST according to the old index, so it must sort as older
+  // even though its name comes second.
+  SdMan.mkdir("/.ardosia");
+  SdMan.testAddFile("/.ardosia/note_seq.bin",
+                    buildSidecar(1, 9, {{"beta.txt", 3}, {"alpha.txt", 7}}));
+
+  refreshFileList();
+
+  check(noteSeqWordsOf("alpha.txt") == NOTE_WORDS_UNKNOWN,
+        "a v1 record has no word count, and says so rather than claiming zero");
+  check(noteSeqWordsOf("beta.txt") == NOTE_WORDS_UNKNOWN, "same for the other one");
+
+  noteSort = NoteSort::OLDEST;
+  refreshFileList();
+  FileInfo* first = noteVisibleAt(0);
+  check(first != nullptr && strcmp(first->filename, "beta.txt") == 0,
+        "the v1 sequence numbers survived: beta is still the older note");
+  noteSort = NoteSort::ALPHA_ASC;
+}
+
+static void testSidecarUpgradesToV2() {
+  printf("sidecar: v1 upgrades in place, keeping the numbers\n");
+  resetFs();
+  SdMan.testAddFile("/notes/alpha.txt", "one two three");
+  SdMan.mkdir("/.ardosia");
+  SdMan.testAddFile("/.ardosia/note_seq.bin", buildSidecar(1, 5, {{"alpha.txt", 4}}));
+  refreshFileList();
+
+  noteSeqSetWords("alpha.txt", 3);
+  check(SdMan.testContent("/.ardosia/note_seq.bin")[4] == 2,
+        "writing a count rewrites the file as v2");
+
+  // Reload from the card and the count is still there, alongside the old order.
+  noteIndexInvalidate();
+  refreshFileList();
+  check(noteSeqWordsOf("alpha.txt") == 3, "the word count survives a reload");
+
+  noteSort = NoteSort::OLDEST;
+  refreshFileList();
+  FileInfo* f = noteVisibleAt(0);
+  check(f != nullptr && f->words == 3, "and reaches the browser through FileInfo");
+  noteSort = NoteSort::ALPHA_ASC;
+}
+
+// The header's record count, read straight back off the card. This is the
+// observable that distinguishes "the index was rebuilt" from "the damaged index
+// was believed" — the note list itself is rebuilt from the folder either way,
+// so counting visible notes proves nothing.
+static int sidecarRecordCount() {
+  const std::string b = SdMan.testContent("/.ardosia/note_seq.bin");
+  if (b.size() < 16) return -1;
+  return static_cast<unsigned char>(b[12]) | (static_cast<unsigned char>(b[13]) << 8);
+}
+static int sidecarVersion() {
+  const std::string b = SdMan.testContent("/.ardosia/note_seq.bin");
+  return b.size() < 5 ? -1 : static_cast<unsigned char>(b[4]);
+}
+
+// Forces the index to be written back, so its contents can be inspected.
+static void flushSidecar(const char* name, uint32_t words) { noteSeqSetWords(name, words); }
+
+static void testSidecarRejectsGarbage() {
+  printf("sidecar: a damaged file is discarded, not trusted\n");
+
+  // Every damaged form names two notes that do NOT exist on the card. If the
+  // index is correctly discarded, the rebuilt one holds exactly the one real
+  // note; if it is believed, the phantoms survive into it.
+  const std::vector<std::pair<std::string, uint32_t>> phantoms = {
+      {"ghost_one.txt", 3}, {"ghost_two.txt", 4}};
+
+  struct Case { const char* what; std::string body; };
+  std::vector<Case> cases;
+  cases.push_back({"an empty index", ""});
+  cases.push_back({"a header cut off after the magic", "NSEQ"});
+  cases.push_back({"a file with the wrong magic", std::string("XXXXX") + std::string(20, '\0')});
+  cases.push_back({"a version from the future", buildSidecar(99, 9, phantoms)});
+  {
+    std::string t = buildSidecar(2, 9, phantoms);
+    t.resize(t.size() - 10);              // last record cut short
+    cases.push_back({"a truncated v2 index", t});
+  }
+  {
+    std::string t = buildSidecar(1, 9, phantoms);
+    t.resize(t.size() - 10);
+    cases.push_back({"a truncated v1 index", t});
+  }
+
+  for (const Case& c : cases) {
+    resetFs();
+    SdMan.testAddFile("/notes/alpha.txt", "one two");
+    SdMan.mkdir("/.ardosia");
+    SdMan.testAddFile("/.ardosia/note_seq.bin", c.body);
+    refreshFileList();
+
+    check(noteVisibleCount() == 1, "the note list still builds");
+    check(noteSeqWordsOf("ghost_one.txt") == NOTE_WORDS_UNKNOWN,
+          "a phantom from a damaged index is not adopted");
+    flushSidecar("alpha.txt", 2);
+    check(sidecarRecordCount() == 1, c.what);
+    check(sidecarVersion() == 2, "and it is rewritten in the current version");
+  }
+}
+
+static void testFreshNotesHaveNoCountYet() {
+  printf("sidecar: a note nobody has saved yet has no count\n");
+
+  // Discovered by a folder scan with no index at all.
+  resetFs();
+  SdMan.testAddFile("/notes/alpha.txt", "one two three");
+  refreshFileList();
+  check(noteSeqWordsOf("alpha.txt") == NOTE_WORDS_UNKNOWN,
+        "a note found on the card has no count until something counts it");
+  FileInfo* f = noteVisibleAt(0);
+  check(f != nullptr && f->words == NOTE_WORDS_UNKNOWN,
+        "and the browser is told it is unknown, not zero");
+
+  // Discovered one at a time, the path a note created here takes.
+  resetFs();
+  SdMan.testAddFile("/notes/alpha.txt", "one");
+  refreshFileList();
+  SdMan.testAddFile("/notes/beta.txt", "two three");
+  noteSeqAssignNew("beta.txt");
+  check(noteSeqWordsOf("beta.txt") == NOTE_WORDS_UNKNOWN,
+        "a newly numbered note has no count either");
+}
+
+static void testWordCountDoesNotThrashTheCard() {
+  printf("sidecar: unchanged counts do not rewrite the card\n");
+  resetFs();
+  SdMan.testAddFile("/notes/alpha.txt", "one two three");
+  refreshFileList();
+  noteSeqSetWords("alpha.txt", 3);
+
+  // Autosave runs every ten idle seconds and calls this each time. Rewriting
+  // the whole index when nothing moved is pure wear on the card.
+  const int before = SdMan.testOpensForWrite();
+  for (int i = 0; i < 20; i++) noteSeqSetWords("alpha.txt", 3);
+  check(SdMan.testOpensForWrite() == before, "twenty identical counts write nothing");
+
+  noteSeqSetWords("alpha.txt", 4);
+  check(SdMan.testOpensForWrite() > before, "a count that actually changed is written");
+
+  // A name with no slot is a no-op, not a new record.
+  const int after = SdMan.testOpensForWrite();
+  noteSeqSetWords("ghost.txt", 12);
+  check(SdMan.testOpensForWrite() == after, "an unknown note writes nothing");
+  check(noteSeqWordsOf("ghost.txt") == NOTE_WORDS_UNKNOWN, "and reports unknown");
+}
+
 int main() {
   testSearchAndSort();
   testTitleToFilename();
@@ -372,6 +625,13 @@ int main() {
   testDeriveUnique();
   testResolveNoteFilename();
   testLoadFileGuard();
+  testDeleteOpenNote();
+  testSidecarV1IsStillRead();
+  testSidecarUpgradesToV2();
+  testSidecarRejectsGarbage();
+  testFreshNotesHaveNoCountYet();
+  testWordCountDoesNotThrashTheCard();
+
   printf("\n%d checks, %d failures\n", checks, failures);
   return failures == 0 ? 0 : 1;
 }

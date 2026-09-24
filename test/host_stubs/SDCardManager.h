@@ -58,6 +58,10 @@ class SDCardManager {
   void testAddFile(const char* path, const std::string& content);
   void testSetCreateDate(const char* path, uint16_t date, uint16_t time);
   std::string testContent(const char* path) const;
+  // Counts open-for-write calls, so a test can assert that a guard actually
+  // stopped a write rather than merely rewriting the same bytes.
+  int testOpensForWrite() const { return opensForWrite; }
+  int opensForWrite = 0;
 
   struct Node {
     bool isDir = false;
