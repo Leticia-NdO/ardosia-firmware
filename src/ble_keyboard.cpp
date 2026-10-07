@@ -51,6 +51,38 @@ static constexpr uint32_t DEVICE_STALE_MS = 10000;  // 10 seconds - reduced to p
 
 // FreeRTOS connect task
 static TaskHandle_t connectTaskHandle = nullptr;
+
+// Why the keyboard is not connecting, when the reason is not the keyboard.
+// Empty while things are healthy. Shown on the Bluetooth screen, because that
+// is where someone goes when the keyboard stops working — and there is no
+// serial console on this device, so a failure that only reaches DBG_PRINTF did
+// not happen.
+static char bleNote[48] = "";
+
+// 12 KB, MEASURED — not the 32768 this fork carried, and not a guess with a
+// margin on a guess. The 32 KB came from a keyboard that panicked and was
+// believed to have done so during service discovery in this task; it cost real
+// money, because 32 KB CONTIGUOUS cannot be found once a WiFi session has
+// fragmented the heap (measured on the device: 68 KB free, largest block
+// 23 KB), and the reconnect then silently never happens — bug #8.
+//
+// What the instrument said before it was removed, with
+// uxTaskGetStackHighWaterMark() on connections that actually COMPLETED:
+// 2 KB used of 32. The reason it reads so low is that discovery does NOT run
+// here — NimBLEClient::retrieveServices() blocks in taskWait(..., FOREVER), so
+// every GATT callback runs on the NimBLE host task instead. That is why
+// CONFIG_BT_NIMBLE_TASK_STACK_SIZE went 4096 -> 8192 in the same change: 4 KB
+// less transient contiguous demand here, 4 KB more where the work is.
+//
+// 12288 is six times the measured use. If a keyboard ever panics in this task
+// again, that measurement is the reference — raise this, and raise the NimBLE
+// host stack with it, rather than re-deriving the number from scratch.
+//
+// The measurement only counted COMPLETED connections, and that was the whole
+// value of it: three of this task's four exits are early bail-outs that never
+// reach discovery, and a high-water mark from one of those reads far emptier
+// than the truth. Anyone re-instrumenting this must keep that distinction.
+static constexpr uint32_t CONNECT_STACK = 12288;
 static volatile bool authSuccess = false;
 
 // Connection timeout in seconds
@@ -501,15 +533,51 @@ static void startConnectTask() {
     DBG_PRINTLN("[BLE] Connect task already running");
     return;
   }
-  // 20480 bytes: Logitech has a complex service tree (keyboard + media + battery reports
-  // + many descriptors). NimBLE 2.x uses more per-call stack than 1.4.x — 12288 was
-  // sufficient before but overflows during full service discovery on the Logitech.
+  // 12288 bytes, measured rather than guessed — and the measurement overturned
+  // the reason the old number existed.
   //
-  // Raised to 32768 in this fork: a keyboard with a heavier service tree still panicked
-  // during discovery at 20480. The device has ~200 KB of free heap at this point, so the
-  // extra 12 KB is cheap insurance. If RAM ever gets tight, this is a safe thing to trim
-  // back — but re-test discovery against the fattest keyboard available first.
-  xTaskCreate(bleConnectTask, "ble_conn", 32768, NULL, 1, &connectTaskHandle);
+  // This stack was 20480, raised to 32768 in this fork with the note that a
+  // keyboard with a heavy service tree "still panicked during discovery at
+  // 20480". That cannot have been this task: NimBLEClient::retrieveServices()
+  // issues the GATT request and then blocks in
+  // taskWait(taskData, BLE_NPL_TIME_FOREVER), so every discovery callback —
+  // services, characteristics, descriptors, the deep part — runs on the NimBLE
+  // HOST task, not here. This task mostly waits.
+  //
+  // Measured with uxTaskGetStackHighWaterMark() on a connection that completed
+  // (full discovery, descriptor reads, subscribe): 2 KB of 32 KB. 12288 is a
+  // 6x margin on that, and unlike 32768 it still fits a heap that a WiFi
+  // session has fragmented — which is the bug this fixes: 32 KB CONTIGUOUS
+  // could not be found after the hotspot (68 KB free, largest block 23 KB), so
+  // xTaskCreate failed and the keyboard silently never came back.
+  //
+  // The real margin for discovery depth is CONFIG_BT_NIMBLE_TASK_STACK_SIZE,
+  // raised from its 4096 default in sdkconfig.defaults. That is where the old
+  // panic most plausibly came from, and raising this task's stack only ever
+  // masked it by changing heap layout.
+  //
+  // The return value is checked, and that is not a formality. This asks for
+  // CONNECT_STACK of CONTIGUOUS heap; on failure FreeRTOS leaves connectTaskHandle
+  // exactly as it was (null) and bleLoop() has already consumed
+  // connectToKeyboard — so an unchecked failure here is completely silent. The
+  // keyboard simply never reconnects, the backoff doubles to its 2-minute cap,
+  // and nothing anywhere says why. That is the reported symptom after a hotspot
+  // session: a WiFi session fragments the heap, and a large contiguous ask is
+  // exactly what it cannot serve (measured: largest free block was 19 KB with
+  // the AP up, against the 32 KB this used to request).
+  if (xTaskCreate(bleConnectTask, "ble_conn", CONNECT_STACK, NULL, 1,
+                  &connectTaskHandle) != pdPASS) {
+    connectTaskHandle = nullptr;  // belt and braces: FreeRTOS may not touch it
+    // Actionable, not just diagnostic: a reboot genuinely fixes this, because
+    // the heap comes back unfragmented.
+    snprintf(bleNote, sizeof(bleNote), "No RAM for BLE - reboot");
+    DBG_PRINTF("[BLE] %s\n", bleNote);
+    // Not the keyboard's fault, so do not punish it with a doubling backoff —
+    // the memory may come back on its own.
+    reconnectDelay = 5000;
+    return;
+  }
+  bleNote[0] = '\0';
 }
 
 // --- NVS multi-keyboard helpers ---
@@ -605,8 +673,16 @@ uint32_t getCurrentPasskey() {
   return currentPasskey;
 }
 
-void bleSetup() {
-  NimBLEDevice::init("Ardosia");
+// The NimBLE half of bleSetup(), split out while a teardown/restore cycle was
+// being attempted for the hotspot. That cycle is gone (see CLAUDE.md bug #7 —
+// it froze the loop task), but the split is worth keeping: it separates the
+// stack from the once-per-boot NVS work around it, and it checks init()'s
+// return value, which the original code discarded.
+static bool bleStackUp() {
+  if (!NimBLEDevice::init("Ardosia")) {
+    DBG_PRINTLN("[BLE] NimBLEDevice::init() failed");
+    return false;
+  }
   // bond=true, MITM=false (we don't require it), SC=false (legacy compat for Logitech etc.)
   // DISPLAY_YESNO: we can show a number and confirm — lets keyboards that *do* want
   // numeric comparison (Apple Magic Keyboard, etc.) initiate it while still falling
@@ -646,16 +722,21 @@ void bleSetup() {
   // radio power is a real share of the battery budget on this device.
   NimBLEDevice::setPower(9);
 
-  prefs.begin("ble_kb", false);
-
-  // Restore from SD backup if NVS was wiped (e.g. after a firmware flash)
-  if (!prefs.isKey("kb_count")) restoreBleBackup();
-
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&scanCallbacks, true);
   scan->setInterval(1349);
   scan->setWindow(449);
   scan->setActiveScan(true);
+  return true;
+}
+
+void bleSetup() {
+  bleStackUp();
+
+  prefs.begin("ble_kb", false);
+
+  // Restore from SD backup if NVS was wiped (e.g. after a firmware flash)
+  if (!prefs.isKey("kb_count")) restoreBleBackup();
 
   // Migrate from old single-keyboard NVS format on first boot after firmware update.
   // Sentinel: if "kb_count" key is absent (returns 0xFF default), run migration.
@@ -744,6 +825,11 @@ bool isKeyboardConnected() {
 
 BLEState getConnectionState() {
   return bleState;
+}
+
+bool bleRadioBusy() {
+  return connectTaskHandle != nullptr || isScanning ||
+         NimBLEDevice::getScan()->isScanning();
 }
 
 void cancelPendingConnection() {
@@ -975,3 +1061,6 @@ void clearStoredDevice() {
   DBG_PRINTLN("[BLE] Cleared all paired keyboards and bonds");
   writeBleBackup();
 }
+
+const char* bleNoteText() { return bleNote; }
+

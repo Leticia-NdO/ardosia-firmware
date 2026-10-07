@@ -246,6 +246,61 @@ static void testResolveNoteFilename() {
   check(noteAppendPrefixNewlines("\n", 1) == 1, "file that is just a newline");
 }
 
+// The GET-path gate. These are the cases from the hotspot threat model: an
+// attacker in Wi-Fi range with the source in front of them, asking the server
+// for something that is not a note. The server never URL-decodes the path, so
+// the encoded forms have to be refused as the literal bytes they arrive as
+// rather than decoded and then judged.
+static void testNoteUriNameIsSafe() {
+  printf("noteUriNameIsSafe: the gate between a URI and the card\n");
+
+  check(noteUriNameIsSafe("dom_casmurro.txt"), "a plain note name passes");
+  check(noteUriNameIsSafe("diario_2.txt"), "so does one from the _2 series");
+
+  // F1, the finding this function exists for. Each of these was a readable
+  // file on the card before the check went in.
+  check(!noteUriNameIsSafe("../ardosia/ui_prefs.json"), "traversal is rejected");
+  check(!noteUriNameIsSafe("../ardosia/wifi.json"), "so is the Wi-Fi backup path");
+  check(!noteUriNameIsSafe("..%2fardosia%2fui_prefs.json"),
+        "an encoded slash is rejected, undecoded");
+  check(!noteUriNameIsSafe("%2e%2e/ardosia/ui_prefs.json"),
+        "and an encoded dot-dot");
+  check(!noteUriNameIsSafe("a/b.txt"), "a slash is rejected");
+  check(!noteUriNameIsSafe("a\\b.txt"), "and a backslash");
+
+  // A '%' anywhere, not only in an escape that means something: no title this
+  // firmware can slug produces one, so the byte itself is the rule.
+  check(!noteUriNameIsSafe("100%.txt"), "any percent sign is rejected");
+
+  // Extension and shape.
+  check(!noteUriNameIsSafe("x.bin"), "a non-.txt extension is rejected");
+  check(!noteUriNameIsSafe(".txt"), "a bare extension is rejected");
+  check(!noteUriNameIsSafe("nope"), "no extension at all is rejected");
+  check(!noteUriNameIsSafe(""), "the empty name is rejected");
+  check(!noteUriNameIsSafe(nullptr), "and so is a null one");
+
+  // Dotfiles: /api/files hides them, so a GET must not fetch them either.
+  check(!noteUriNameIsSafe(".hidden.txt"), "a leading dot is rejected");
+  check(noteUriNameIsSafe("mid.dle.txt"), "but a dot inside the name is fine");
+
+  // Control bytes. The NUL case is the string terminator, so the name it makes
+  // is "a" — no extension — and is rejected for that; the others are the point.
+  check(!noteUriNameIsSafe("a\nb.txt"), "a newline is rejected");
+  check(!noteUriNameIsSafe("a\rb.txt"), "a carriage return is rejected");
+  check(!noteUriNameIsSafe("a\tb.txt"), "a tab is rejected");
+  check(!noteUriNameIsSafe("\x01" "ab.txt"), "a bare control byte is rejected");
+
+  // DOCUMENTED CHOICE: uppercase passes. noteFilenameIsSafe compares the
+  // extension with strcasecmp, FAT is case-insensitive, and a card written on
+  // a PC carries such names — refusing them would hide real notes.
+  check(noteUriNameIsSafe("NOTE.TXT"), "an uppercase .TXT is accepted");
+  check(noteUriNameIsSafe("Diario.Txt"), "and a mixed-case one");
+
+  // Accented bytes are ordinary UTF-8, not control bytes: titleToFilename
+  // folds them, but a file dropped on the card by hand keeps them.
+  check(noteUriNameIsSafe("diário.txt"), "a UTF-8 name passes");
+}
+
 // Deleting the note that is OPEN is the one sequence in this firmware that can
 // undo itself: the autosave fires on a ten-second idle, Esc saves on the way
 // out of the editor, and so does the power button — so a buffer still marked
@@ -624,6 +679,7 @@ int main() {
   testUtf8Validate();
   testDeriveUnique();
   testResolveNoteFilename();
+  testNoteUriNameIsSafe();
   testLoadFileGuard();
   testDeleteOpenNote();
   testSidecarV1IsStillRead();

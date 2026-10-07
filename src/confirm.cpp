@@ -61,6 +61,10 @@ const char* confirmQuestion(ConfirmKind kind) {
     case ConfirmKind::DeleteNote:
     case ConfirmKind::DeleteOpenNote:  return "Delete this note?";
     case ConfirmKind::ForgetKeyboard:  return "Forget this keyboard?";
+    // The consequence, not the mechanism: "regenerate" is what the row is
+    // called, and what the box has to say is what breaks.
+    case ConfirmKind::RegenerateHotspotPw: return "New hotspot password?";
+    case ConfirmKind::InstallRecovery:     return "Write recovery firmware?";
     default:                           return "";
   }
 }
@@ -70,6 +74,8 @@ const char* confirmVerb(ConfirmKind kind) {
     case ConfirmKind::DeleteNote:
     case ConfirmKind::DeleteOpenNote:  return "Delete";
     case ConfirmKind::ForgetKeyboard:  return "Forget";
+    case ConfirmKind::RegenerateHotspotPw: return "Regenerate";
+    case ConfirmKind::InstallRecovery:     return "Write";
     default:                           return "";
   }
 }

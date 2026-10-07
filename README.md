@@ -23,10 +23,10 @@ customisable sleep screens.
 - **Dark Mode** — inverted display
 - **Display Orientation** — portrait, landscape, and inverted variants
 - **Power Management** — ESP-IDF light sleep between loop iterations (CPU drops to 10MHz), BLE modem sleep keeps the radio alive, SD card sleeps between accesses, display analog circuits power down after each refresh, and the device enters deep sleep after 5 minutes of inactivity
-- **WiFi Sync** — *the Sync entry is currently hidden from the main menu; Hotspot is not. See the WiFi Sync section.* One-button backup of all notes to your PC over WiFi. Saves network credentials for instant reconnect. The device runs an HTTP server and the PC pulls from it; downloads are read-only, but a `POST /notes` route can append to a note while sync or the hotspot is up
+- **WiFi Sync** — *the Sync entry is currently hidden from the main menu; Hotspot is not. See the WiFi Sync section.* One-button backup of all notes to your PC over WiFi. Saves network credentials for instant reconnect. The device runs an HTTP server and the PC pulls from it; downloads are read-only, but a `POST /notes` route can append to a note while the hotspot is up
 - **Standalone Build** — all libraries are bundled in the repo; no sibling projects required
 - **Dual-Boot** — optional combined firmware that includes CrossPoint (an e-reader) in a second OTA slot. A "CrossPoint" entry appears in the main menu; selecting it reboots into the reader. CrossPoint gains a reciprocal "Ardosia" entry. Both apps work normally when flashed standalone.
-- **Settings Backup** — BLE pairing info, WiFi credentials, and UI preferences are backed up to the SD card as JSON files. They are silently restored after a firmware flash so you don't need to re-pair your keyboard or re-enter WiFi passwords.
+- **Settings Backup** — BLE pairing info and UI preferences are backed up to the SD card as JSON files. They are silently restored after a firmware flash so you don't need to re-pair your keyboard. **WiFi passwords are deliberately not backed up** — see [WiFi Sync](#wifi-sync).
 
 ## Hardware Requirements
 
@@ -243,9 +243,16 @@ measures itself and tightens its padding there. It never drops a tab.
 | Dark Mode | Light / Dark |
 | Orientation | Portrait, Landscape CW, Inverted, Landscape CCW |
 | Sleep Screen | Text, Slideshow, Shuffle |
+| Hotspot Password | *Regenerate* — Enter asks to confirm, then mints a new hotspot passphrase |
 
 Dark Mode is here rather than under Editor because it inverts every screen, not
 just the page you type on.
+
+**Hotspot Password** is the only row on this screen that does not cycle a value.
+Enter raises a confirmation box that starts on Cancel; confirming throws the old
+passphrase away. Any phone or X3 that saved the old one has to be told the new
+one, which the Hotspot screen shows. If the hotspot happens to be up at the time,
+it restarts and connected devices are dropped.
 
 #### Editor
 
@@ -378,8 +385,54 @@ python3 sync/ardosia_sync.py
 - One-way backup (STA Sync): device → PC. The PC never uploads or deletes.
 - Files already on the PC with the same name and size are skipped
 - Files deleted from the device are **not** deleted from the PC — they stay as a backup
-- **Sync (Hotspot)** raises a WPA2 access point (`Ardosia`) so another device can `POST /notes` and append to a note. POST is accepted only while the hotspot (or STA sync) is up; the path is sanitized and the body is capped.
+- **Sync (Hotspot)** raises a WPA2 access point so another device can `POST /notes`
+  and append to a note. See **Hotspot network name and password** below.
+- `POST /notes` is accepted **only while the hotspot is up**. In STA Sync mode it
+  returns **403**: there the device is a guest on a network whose admission it
+  does not control, so anyone already on that LAN could write to the card. On its
+  own access point the device holds the passphrase and therefore decides who is
+  on the network.
+- `GET /notes/<name>` only ever serves a plain `something.txt` from `/notes/`.
+  A name containing `/`, `\`, `..`, `%`, a control byte, or a leading dot is
+  refused with **400** before the card is touched, and so is any extension other
+  than `.txt`.
 - WiFi turns off automatically after sync completes, after 60 seconds of no HTTP activity, or — on the hotspot with nobody joined — after 5 minutes
+
+#### Hotspot network name and password
+
+The hotspot's network name and passphrase are **different on every device**, and
+neither is in this repository.
+
+| | |
+|---|---|
+| **Network name** | `Ardosia-XXXX`, where `XXXX` is the last two bytes of the device's WiFi MAC address in hex. Derived from the hardware, so it never changes. |
+| **Passphrase** | 11 characters in the form `xxxxx-xxxxx` (the hyphen is part of it). Generated on the device the first time the hotspot starts, then kept. |
+
+Both are shown on the **Hotspot** screen, which is where you read them off to
+join. The passphrase is drawn from 31 characters — lowercase letters and the
+digits 2–9, with `0 O 1 l I` left out, because you type it back in on a phone.
+
+Where it lives: the passphrase is stored **only in the device's internal NVS
+flash**. It is never written to the SD card, never printed to the serial console,
+and is not in the firmware image — so two devices flashed from the same
+`firmware.bin` still have different passphrases.
+
+To change it: **Settings → System → Hotspot Password → Regenerate**.
+
+**Upgrading from an earlier build:** builds before this one used the fixed network
+name `Ardosia` with the fixed passphrase `ardosia12`, which was published in this
+repository and identical on every device — in practice an open network that
+accepted writes. After updating, anything that joined the old hotspot has to be
+pointed at the new name and passphrase. If you send clippings from an X3, that is
+the one thing you have to reconfigure there.
+
+**WiFi passwords are not backed up to the SD card.** Earlier builds mirrored the
+credentials of the networks you joined into `/ardosia/wifi.json` so they would
+survive a firmware flash. That file put the password of your *home* network in
+plaintext on a removable card, so it is gone: the firmware deletes it on the next
+boot and never writes it again. The cost is that after a flash that wipes NVS you
+type the STA WiFi password once more. Encrypting the file instead would not have
+helped — it existed to survive an NVS wipe, and a key kept in NVS does not.
 
 #### Sync controls
 
@@ -444,15 +497,38 @@ ardosia-firmware/
 
 ---
 
-## Credits
+## Credits & licences
 
 Ardosia is a fork of **MicroSlate** by Josh (TypeSlate). The upstream project is
 where almost all of this firmware comes from — support it at
 [ko-fi.com/typeslate](https://ko-fi.com/typeslate).
 
-- **MicroSlate** — [github.com/Josh-writes/microslate-firmware](https://github.com/Josh-writes/microslate-firmware)
+- **MicroSlate** — [github.com/Josh-writes/microslate-firmware](https://github.com/Josh-writes/microslate-firmware) (MIT)
 - **TypeSlate** — [typeslate.com](https://typeslate.com), a distraction-free writing app for Windows
 
-`lib/RecoveryBoot/` is vendored from the [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk)
-and the bundled `lib/` display, font, input and SD libraries come from
-[crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader) (MIT).
+Ardosia also contains code from:
+
+| Project | Used in | Licence |
+|---------|---------|---------|
+| [crosspoint-reader](https://github.com/crosspoint-reader/crosspoint-reader) | `lib/GfxRenderer`, `lib/EpdFont`, `lib/Utf8`, `lib/hal`, the partition layout, the sleep screens | MIT |
+| [OpenX4 E-Paper Community SDK](https://github.com/open-x4-epaper/community-sdk) | `lib/EInkDisplay`, `lib/InputManager`, `lib/SDCardManager`, `lib/BatteryMonitor` | MIT |
+| [FreeInk SDK](https://github.com/Free-Ink/freeink-sdk) | `lib/RecoveryBoot` — the Escape Hatch, vendored byte for byte | MIT |
+| [CrossInk](https://github.com/uxjulia/CrossInk) | the soft access point in `src/wifi_sync.cpp`, the sleep screen layout | MIT |
+| [epdiy](https://github.com/vroland/epdiy) | `lib/EpdFont/EpdFontData.h`, `lib/EpdFont/scripts/fontconvert.py` | **LGPL-3.0** |
+| [SdFat](https://github.com/greiman/SdFat) | linked into the firmware | MIT |
+| [esp-nimble-cpp](https://github.com/h2zero/esp-nimble-cpp) | the BLE stack | Apache-2.0 |
+| [arduino-esp32](https://github.com/espressif/arduino-esp32) / [ESP-IDF](https://github.com/espressif/esp-idf) | the framework | LGPL-2.1 / Apache-2.0 |
+
+Fonts compiled into the firmware: **Noto Sans** and **JetBrains Mono**, both
+under the SIL Open Font License 1.1.
+
+Ardosia itself is MIT — see [LICENSE](LICENSE). **Two files are not:**
+`lib/EpdFont/EpdFontData.h` and `lib/EpdFont/scripts/fontconvert.py` come from
+epdiy and keep its LGPL-3.0 licence; both carry an SPDX header saying so, and the
+licence texts are in [`LICENSES/`](LICENSES).
+
+**[`NOTICE`](NOTICE) is the complete list**, with the copyright lines, the
+attribution notices that Apache-2.0 requires reproduced verbatim, and build
+instructions for relinking the statically linked LGPL libraries. Every release
+attaches `LICENSE` and `NOTICE` next to `firmware.bin`, because the fonts and
+libraries travel inside the binary and their notices have to travel with it.

@@ -48,6 +48,31 @@ bool resolveNoteFilename(const char* title, bool replace, char* out, int maxLen)
 // True if `filename` is a bare "something.txt" with no slash or "..".
 bool noteFilenameIsSafe(const char* filename);
 
+// THE gate between a request URI and the SD card. Every HTTP route that turns
+// part of a URI into a /notes/ path goes through this and nothing else, so the
+// rule cannot be enforced in one route and forgotten in the next — which is
+// exactly how `GET /notes/../ardosia/wifi.json` came to be readable by anyone
+// in Wi-Fi range.
+//
+// Stricter than noteFilenameIsSafe() on three counts, all of them because the
+// name arrives from the network verbatim:
+//
+//   no '%'          The server does not URL-decode the path, so "..%2f" would
+//                   reach the card as literal text and SdFat, not this code,
+//                   would decide what it means. No note name a title can
+//                   produce contains a '%', so refusing the byte costs nothing
+//                   and takes the question away entirely.
+//   no byte < 0x20  Control bytes have no place in a FAT name and are how a
+//                   name gets truncated somewhere downstream.
+//   no leading '.'  The listing at /api/files hides dotfiles; a file the
+//                   listing will not name should not be fetchable either.
+//                   This also rejects a bare ".txt".
+//
+// An uppercase ".TXT" IS accepted: noteFilenameIsSafe compares the extension
+// case-insensitively, FAT itself is case-insensitive, and a card written on a
+// PC really does carry such names.
+bool noteUriNameIsSafe(const char* name);
+
 // Count of .txt notes on the card, not capped by MAX_FILES.
 int countNoteFiles();
 

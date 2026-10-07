@@ -50,18 +50,67 @@ int InputManager::getButtonFromADC(const int adcValue, const int ranges[], const
   return -1;
 }
 
+// ARDOSIA FORK CHANGE — median of three, instead of a single conversion.
+//
+// A single bad conversion becomes a BUTTON PRESS here, and on this ladder it
+// becomes a direction specifically: both channels decode their bottom band
+// open-ended toward zero (anything <= 750 on channel 1 is Right, <= 1120 on
+// channel 2 is Down), and neither has a "reading is implausible" verdict. So a
+// read that merely comes back low is never rejected — it is decoded.
+//
+// Measured on an X4 over five rounds of instrumentation: phantom Right presses
+// fire with nothing touching the device, and a second conversion of the SAME
+// pin taken microseconds later in the same loop iteration reads 4095 — full
+// rest. So the voltage is fine and the conversion is not. The leading
+// explanation is that the bad read is the first conversion after the CPU wakes
+// from light sleep: this call site is the first ADC use after the delay() that
+// ends loop(), and adc1_get_raw() takes no PM lock (only ADC2 has one) while
+// powering the SAR up per call.
+//
+// Three conversions and the median kills it whichever way that lands, because
+// only the FIRST of the three is a post-wake read — and it kills it even when
+// two consecutive polls are both bad, which is what the measured 2-sample
+// phantom duration requires. Same remedy, same ADC unit, and the same stated
+// reason as BatteryMonitor::readMillivolts(), which already takes a median of
+// seven here "to reject outliers from SPI/BLE/charging noise".
+//
+// Cost is two extra conversions per channel per poll, about 60us, against a
+// 10ms poll. Upstream candidate: this is a crosspoint/FreeInk bug, not ours.
+static uint32_t s_filteredSamples = 0;
+
+static int medianOfThree(const adc1_channel_t channel) {
+  const int a = adc1_get_raw(channel);
+  const int b = adc1_get_raw(channel);
+  const int c = adc1_get_raw(channel);
+
+  // Branch-free median of three.
+  const int lo = a < b ? a : b;
+  const int hi = a < b ? b : a;
+  int med = c < lo ? lo : (c > hi ? hi : c);
+
+  // Count the polls where the three did not agree, so that "the phantom
+  // stopped" can be told apart from "the filter is doing work". Without this,
+  // a fix and a coincidence look identical. Diagnostic only — see BUTTON_DIAG
+  // in src/main.cpp; it goes when that goes.
+  if (a != b || b != c) s_filteredSamples++;
+
+  return med;
+}
+
+uint32_t InputManager::getFilteredSampleCount() { return s_filteredSamples; }
+
 uint8_t InputManager::getState() {
   uint8_t state = 0;
 
   // Read GPIO1 buttons using ESP-IDF API (no GPIO reconfiguration overhead)
-  const int adcValue1 = adc1_get_raw(ADC1_CHANNEL_1);
+  const int adcValue1 = medianOfThree(ADC1_CHANNEL_1);
   const int button1 = getButtonFromADC(adcValue1, ADC_RANGES_1, NUM_BUTTONS_1);
   if (button1 >= 0) {
     state |= (1 << button1);
   }
 
   // Read GPIO2 buttons using ESP-IDF API
-  const int adcValue2 = adc1_get_raw(ADC1_CHANNEL_2);
+  const int adcValue2 = medianOfThree(ADC1_CHANNEL_2);
   const int button2 = getButtonFromADC(adcValue2, ADC_RANGES_2, NUM_BUTTONS_2);
   if (button2 >= 0) {
     state |= (1 << (button2 + 4));

@@ -1,5 +1,7 @@
 #pragma once
 #include <SDCardManager.h>
+
+#include "note_json.h"
 #include <cstring>
 
 // All SD backups of this fork live in one folder. Kept as a constant so a
@@ -85,11 +87,5 @@ static inline bool jsonGetStr(const char* json, const char* key, char* out, size
 }
 
 // Append an escaped JSON string value (no surrounding quotes).
-static inline void jsonAppendStr(char* buf, size_t bufSize, const char* src) {
-    size_t pos = strlen(buf);
-    while (*src && pos < bufSize - 2) {
-        if (*src == '"' || *src == '\\') buf[pos++] = '\\';
-        buf[pos++] = *src++;
-    }
-    buf[pos] = '\0';
-}
+// jsonAppendStr moved to src/note_json.h so it could be host-tested; the
+// name is unchanged, so every caller is unaffected.

@@ -41,7 +41,8 @@ static const int kModCount = (int)(sizeof(kMods) / sizeof(kMods[0]));
 
 static const ConfirmKind kKinds[] = {ConfirmKind::DeleteNote,
                                      ConfirmKind::DeleteOpenNote,
-                                     ConfirmKind::ForgetKeyboard};
+                                     ConfirmKind::ForgetKeyboard,
+                                     ConfirmKind::RegenerateHotspotPw};
 
 // ---------------------------------------------------------------------------
 
@@ -258,6 +259,15 @@ static void testWords() {
   check(strcmp(confirmVerb(ConfirmKind::DeleteNote),
                confirmVerb(ConfirmKind::DeleteOpenNote)) == 0,
         "with the same verb");
+  // Regenerating the hotspot password is not a delete and must not borrow a
+  // delete's words: a box that said "Delete" over a Wi-Fi setting would be read
+  // as the notes going away.
+  check(strcmp(confirmVerb(ConfirmKind::RegenerateHotspotPw),
+               confirmVerb(ConfirmKind::DeleteNote)) != 0,
+        "regenerating does not say 'Delete'");
+  check(strstr(confirmQuestion(ConfirmKind::RegenerateHotspotPw), "note") == nullptr,
+        "nor does its question mention a note");
+
   check(confirmQuestion(ConfirmKind::None)[0] == '\0', "None has no question");
   check(confirmVerb(ConfirmKind::None)[0] == '\0', "and no verb");
 }

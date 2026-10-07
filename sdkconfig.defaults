@@ -46,3 +46,66 @@ CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 CONFIG_ESP_COREDUMP_DATA_FORMAT_ELF=y
 CONFIG_ESP_COREDUMP_CHECKSUM_SHA256=y
 CONFIG_ESP_COREDUMP_STACK_SIZE=1024
+
+# --- Orçamento de RAM: o hotspot tem que caber junto com o BLE --------------
+#
+# Bug #7. Medido no aparelho: 63k livres ao entrar no hotspot, o AP WiFi come
+# 46k e o servidor HTTP 7k, sobrando 10k — e aí o servidor DHCP não consegue
+# alocar um pbuf para responder o lease e o accept() não consegue alocar um
+# cliente, enquanto o LwIP ainda completa o handshake TCP com PCB do pool dele.
+# Conecta e nunca responde.
+#
+# A primeira tentativa de conserto foi desmontar a stack NimBLE durante o
+# hotspot (NimBLEDevice::deinit/init). Funcionou para a memória e **travou a
+# task do loop** — tela congelada, só saindo por reboot, num aparelho sem
+# recuperação por USB. Inaceitável, e revertido.
+#
+# Então o orçamento é atacado onde não há risco de pendurar: os dois lados
+# estavam inteiramente no default, dimensionados para throughput que este
+# aparelho não tem o que fazer com. Nada aqui muda controle de fluxo em
+# runtime; são tamanhos de pool decididos em tempo de compilação.
+
+# WiFi: buffers dimensionados para um AP que serve um cliente copiando notas,
+# não para um roteador. STATIC_RX é alocado na inicialização do WiFi e é a
+# economia mais direta: 10 x ~1,6k -> 4 x ~1,6k.
+CONFIG_ESP32_WIFI_STATIC_RX_BUFFER_NUM=4
+CONFIG_ESP32_WIFI_DYNAMIC_RX_BUFFER_NUM=8
+CONFIG_ESP32_WIFI_DYNAMIC_TX_BUFFER_NUM=8
+CONFIG_ESP32_WIFI_MGMT_SBUF_NUM=8
+
+# AMPDU é agregação de quadros para throughput alto. Custa as janelas de block
+# ack (6 quadros em cada direção) e não compra nada numa transferência de
+# alguns KB de texto por um cliente.
+# CONFIG_ESP32_WIFI_AMPDU_TX_ENABLED is not set
+# CONFIG_ESP32_WIFI_AMPDU_RX_ENABLED is not set
+
+# WPA3/SAE: o AP é WPA2 (ver apEnsurePassword). Código e tabelas que nunca
+# executam.
+# CONFIG_ESP32_WIFI_ENABLE_WPA3_SAE is not set
+
+# LwIP: janelas de TCP por socket. 5760 é dimensionado para rede local rápida;
+# 2880 ainda é o dobro de um MSS e a exportação é streaming de qualquer forma.
+CONFIG_LWIP_TCP_SND_BUF_DEFAULT=2880
+CONFIG_LWIP_TCP_WND_DEFAULT=2880
+
+# NimBLE: isto sobe a linha de base dos 64k, que é metade do problema.
+# Um teclado por vez — o aparelho é central, nunca periférico.
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+# CONFIG_BT_NIMBLE_ROLE_PERIPHERAL is not set
+# CONFIG_BT_NIMBLE_ROLE_BROADCASTER is not set
+# Relatórios HID são de alguns bytes; 256 de MTU reserva buffer para nada.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=128
+CONFIG_BT_NIMBLE_MSYS1_BLOCK_COUNT=8
+CONFIG_BT_NIMBLE_MAX_CCCDS=4
+# MAX_BONDS fica em 3: é capacidade de pareamento que a UI expõe, não folga.
+
+# A descoberta de serviços GATT roda AQUI, não na task de conexão:
+# NimBLEClient::retrieveServices() dispara o pedido e bloqueia em
+# taskWait(BLE_NPL_TIME_FOREVER), então todos os callbacks de descoberta
+# (serviços, características, descritores) executam na host task do NimBLE.
+#
+# O default é 4096. O comentário do fork dizia que um teclado de árvore de
+# serviços pesada dava panic "durante a descoberta" e por isso o stack da task
+# de conexão foi de 20480 para 32768 — mas aquele stack não é onde a descoberta
+# acontece. Medido, a task de conexão usa 2 KB. Esta é a margem que faltava.
+CONFIG_BT_NIMBLE_TASK_STACK_SIZE=8192

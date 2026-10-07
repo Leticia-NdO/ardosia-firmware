@@ -40,6 +40,12 @@ bool editorGetSelectionRange(int* lo, int* hi);
 // cut and paste do not. Paste that would exceed TEXT_BUFFER_SIZE changes
 // nothing. The clipboard survives opening or creating another note.
 void editorCopy();
+
+// Hand the clipboard's 16 KB back to the heap. Called when the WiFi hotspot
+// goes up, where that margin decides whether DHCP and the HTTP server can
+// allocate at all. The next copy allocates it again; a pending paste is lost,
+// which is the whole cost.
+void editorClipboardRelease();
 void editorCut();
 void editorPaste();
 

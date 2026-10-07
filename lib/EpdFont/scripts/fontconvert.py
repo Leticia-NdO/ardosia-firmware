@@ -1,4 +1,20 @@
 #!python3
+#
+# Originally from epdiy — https://github.com/vroland/epdiy
+#
+# SPDX-License-Identifier: LGPL-3.0-or-later
+#
+# THIS FILE IS NOT MIT, unlike the rest of this repository (see ../../LICENSE).
+# epdiy is licensed under the GNU Lesser General Public License version 3; the
+# full text is in ../../LICENSES/LGPL-3.0.txt, together with the GPL-3.0 text it
+# incorporates by reference in ../../LICENSES/GPL-3.0.txt.
+#
+# This is a build tool: it converts a TTF into one of the headers in
+# ../builtinFonts and is never compiled into the firmware. It is in the
+# repository so the headers that ARE shipped can be regenerated — see
+# convert-builtin-fonts.sh beside it.
+#
+# Copyright (c) the epdiy authors.
 import freetype
 import zlib
 import sys

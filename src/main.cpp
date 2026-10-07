@@ -10,6 +10,10 @@
 #include <RecoveryBoot.h>
 #include "sd_backup.h"
 #include "dpad.h"
+#include "escape.h"
+#include "ota_names.h"
+#include "hatch_flash.h"
+#include "dev_wipe.h"  // TEMPORARY — delete before release
 #include "confirm.h"
 #include "quickmenu.h"
 
@@ -140,18 +144,52 @@ SleepBrightness sleepBrightness = SleepBrightness::NORMAL;
 OtaAppEntry otaApps[MAX_OTA_APPS];
 int otaAppCount = 0;
 
+// Record a display name for an OTA slot, together with the project_name of
+// whatever is in that slot right now.
+//
+// The project is the whole point: a name keyed by slot ALONE outlives the
+// firmware it described. A device whose ota_0 had been CrossInk kept offering
+// "CrossInk" in the menu after the Escape Hatch was written over it — the entry
+// booted the hatch correctly, and only the label lied. Recording the project
+// lets otaDisplayName() tell "this name still describes what is here" from
+// "this name is left over". See src/ota_names.h.
+static void writeOtaSlotName(const int slot, const char* name,
+                             const char* project) {
+  if (slot < 0 || slot > 15) return;
+  char key[8];
+  char projKey[8];
+  snprintf(key, sizeof(key), "ota_%d", slot);
+  snprintf(projKey, sizeof(projKey), "otap_%d", slot);
+  Preferences prefs;
+  prefs.begin("ota_names", false);
+  if (name == nullptr || name[0] == '\0') {
+    prefs.remove(key);
+    prefs.remove(projKey);
+  } else {
+    prefs.putString(key, name);
+    prefs.putString(projKey, project ? project : "");
+  }
+  prefs.end();
+}
+
 // Register this app's display name in shared NVS, keyed by OTA slot number.
 static void registerOtaAppName(const char* name) {
   const esp_partition_t* self = esp_ota_get_running_partition();
   if (!self) return;
-  int slot = self->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
-  char key[8];
-  snprintf(key, sizeof(key), "ota_%d", slot);
-  Preferences prefs;
-  prefs.begin("ota_names", false);
-  prefs.putString(key, name);
-  prefs.end();
-  DBG_PRINTF("[OTA] Registered as \"%s\" in slot %d\n", name, slot);
+  const int slot = self->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
+
+  // Our own project_name, so the name we register is verifiable the same way
+  // every other slot's is.
+  esp_app_desc_t selfDesc = {};
+  const char* project = "";
+  char projectBuf[33] = {0};
+  if (esp_ota_get_partition_description(self, &selfDesc) == ESP_OK) {
+    otaTrimField(selfDesc.project_name, projectBuf, sizeof(projectBuf));
+    project = projectBuf;
+  }
+  writeOtaSlotName(slot, name, project);
+  DBG_PRINTF("[OTA] Registered as \"%s\" in slot %d (project %s)\n", name, slot,
+             project);
 }
 
 // Rename another app's menu entry. The name lives in the same shared NVS
@@ -164,20 +202,29 @@ bool renameOtaApp(int index, const char* name) {
   const int slot = otaApps[index].partitionSubtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
   if (slot < 0 || slot > 15) return false;
 
-  char key[8];
-  snprintf(key, sizeof(key), "ota_%d", slot);
-  Preferences prefs;
-  prefs.begin("ota_names", false);
-  if (name[0] == '\0') prefs.remove(key);
-  else                  prefs.putString(key, name);
-  prefs.end();
-
-  if (name[0] == '\0') {
-    snprintf(otaApps[index].name, sizeof(otaApps[index].name), "OTA Slot %d", slot);
-  } else {
-    strncpy(otaApps[index].name, name, sizeof(otaApps[index].name) - 1);
-    otaApps[index].name[sizeof(otaApps[index].name) - 1] = '\0';
+  // Record it against the project that is in the slot now, so a user's chosen
+  // name survives an update of that app and is dropped if the slot is replaced
+  // by a different one.
+  const esp_partition_t* part = esp_partition_find_first(
+      ESP_PARTITION_TYPE_APP,
+      static_cast<esp_partition_subtype_t>(otaApps[index].partitionSubtype), nullptr);
+  char project[33] = {0};
+  esp_app_desc_t desc = {};
+  if (part && esp_ota_get_partition_description(part, &desc) == ESP_OK) {
+    otaTrimField(desc.project_name, project, sizeof(project));
   }
+  writeOtaSlotName(slot, name, project);
+
+  // Recompute the label through the same path detectOtaApps() uses, so clearing
+  // a name lands on whatever the slot actually is rather than always on the
+  // generic "OTA Slot N".
+  OtaNameInputs in;
+  in.nickname = name;
+  in.nicknameProject = (name[0] == '\0') ? "" : project;
+  in.slotProject = project;
+  in.slotIsEmbeddedHatch = otaApps[index].isEmbeddedHatch;
+  in.slot = slot;
+  otaDisplayName(in, otaApps[index].name, sizeof(otaApps[index].name));
   return true;
 }
 
@@ -198,19 +245,32 @@ static void detectOtaApps() {
 
       esp_app_desc_t desc;
       if (esp_ota_get_partition_description(part, &desc) == ESP_OK) {
-        int slot = part->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
+        const int slot = part->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
         char key[8];
+        char projKey[8];
         snprintf(key, sizeof(key), "ota_%d", slot);
-        String nvsName = otaPrefs.getString(key, "");
+        snprintf(projKey, sizeof(projKey), "otap_%d", slot);
+        const String nvsName = otaPrefs.getString(key, "");
+        const String nvsProject = otaPrefs.getString(projKey, "");
+
+        // The descriptor was already being fetched here and then thrown away —
+        // only its success was used, as an "is there an app" test. It carries
+        // the slot's real identity, which is what makes a stale nickname
+        // detectable at all.
+        char slotProject[33] = {0};
+        otaTrimField(desc.project_name, slotProject, sizeof(slotProject));
 
         OtaAppEntry& entry = otaApps[otaAppCount];
-        if (nvsName.length() > 0) {
-          strncpy(entry.name, nvsName.c_str(), sizeof(entry.name) - 1);
-        } else {
-          snprintf(entry.name, sizeof(entry.name), "OTA Slot %d", slot);
-        }
-        entry.name[sizeof(entry.name) - 1] = '\0';
         entry.partitionSubtype = part->subtype;
+        entry.isEmbeddedHatch = hatchSlotHoldsEmbeddedHatch(part);
+
+        OtaNameInputs in;
+        in.nickname = nvsName.c_str();
+        in.nicknameProject = nvsProject.c_str();
+        in.slotProject = slotProject;
+        in.slotIsEmbeddedHatch = entry.isEmbeddedHatch;
+        in.slot = slot;
+        otaDisplayName(in, entry.name, sizeof(entry.name));
         otaAppCount++;
       }
     }
@@ -278,6 +338,152 @@ static void updateScreen() {
   }
 }
 
+// --- Embedded recovery firmware: the Settings row ----------------------------
+// Decision logic in src/hatch.h (pure, host-tested), flash write in
+// src/hatch_flash.h. This is only the glue the UI needs.
+//
+// The write is deferred by one loop iteration on purpose. Doing it inside the
+// key dispatch would start a multi-second flash write while the screen still
+// showed the confirm dialog, which on e-ink is indistinguishable from a freeze —
+// and a user who thinks it froze pulls the power, mid-write. Setting a flag and
+// letting updateScreen() run first means the row is already reading "Writing…"
+// on the glass before a single sector is erased.
+//
+// An interrupted write is recoverable, which is why this is safe to offer at
+// all: a half-written slot fails the 0xE9 magic test, so escape.h simply does
+// not offer it and the row goes back to saying "Install". The running firmware
+// is never touched.
+static bool hatchInstallPending = false;
+static bool hatchHasResult = false;
+static HatchFlashResult hatchResult = HatchFlashResult::OK;
+
+// hatchReadContext() reads two eFuses and a partition header, so it is cached
+// rather than run on every redraw. Invalidated after a write, which is the only
+// thing that can change the answer.
+static bool hatchCtxValid = false;
+static HatchContext hatchCtx;
+
+static const HatchContext& hatchContext() {
+  if (!hatchCtxValid) {
+    hatchCtx = hatchReadContext();
+    hatchCtxValid = true;
+  }
+  return hatchCtx;
+}
+
+// What the row's value column shows. Non-static: ui_renderer calls it.
+void hatchRowText(char* out, const size_t n) {
+  if (hatchInstallPending) {
+    snprintf(out, n, "Writing - keep power on");
+    return;
+  }
+  if (hatchHasResult && hatchResult != HatchFlashResult::OK) {
+    snprintf(out, n, "Failed: %s", hatchFlashResultName(hatchResult));
+    return;
+  }
+  const HatchContext& ctx = hatchContext();
+  hatchOfferText(ctx, hatchOfferFor(ctx), out, n);
+}
+
+// Whether Enter on the row should raise the confirm dialog at all. The four
+// non-actionable offers explain themselves in the value column instead; a
+// dialog that asks a question whose only answer is "no" is noise.
+bool hatchRowActionable() {
+  if (hatchInstallPending) return false;
+  const HatchContext& ctx = hatchContext();
+  return hatchOfferIsActionable(hatchOfferFor(ctx));
+}
+
+// True when the device has no USB way back, so the row is worth pointing at.
+bool hatchRowRecommended() {
+  return hatchUrgencyFor(hatchContext().deviceLocked) == HatchUrgency::Recommended;
+}
+
+void hatchRequestInstall() {
+  if (!hatchRowActionable()) return;
+  hatchInstallPending = true;
+  hatchHasResult = false;
+  screenDirty = true;
+}
+
+// Called from loop() once the "Writing…" row has actually reached the panel.
+static void hatchServiceInstall() {
+  if (!hatchInstallPending) return;
+  hatchInstallPending = false;
+  hatchResult = hatchFlashToOtherSlot();
+  hatchHasResult = true;
+  hatchCtxValid = false;   // the other slot changed; re-read it
+
+  if (hatchResult == HatchFlashResult::OK) {
+    // The slot's contents just changed, so everything derived from them is now
+    // stale. Both of these were missing and both were visible as the same
+    // symptom — the main menu kept the name of whatever used to be in the slot,
+    // and pressing it booted the new firmware under the old label.
+    //
+    // 1. Any nickname recorded for that slot described the app we just
+    //    overwrote. Clearing it lets otaDisplayName() fall through to the
+    //    descriptor, which now reads as the recovery firmware.
+    const esp_partition_t* other = esp_ota_get_next_update_partition(nullptr);
+    if (other) {
+      const int slot = other->subtype - ESP_PARTITION_SUBTYPE_APP_OTA_0;
+      writeOtaSlotName(slot, nullptr, nullptr);
+    }
+
+    // 2. detectOtaApps() ran once, in setup(). Without re-running it the menu
+    //    keeps the list it built at boot until the next reboot — so an install
+    //    done in this session was invisible even with the naming fixed.
+    detectOtaApps();
+    screenDirty = true;
+  }
+
+  screenDirty = true;
+  DBG_PRINTF("[HATCH] install: %s\n", hatchFlashResultName(hatchResult));
+}
+
+// --- Generalised escape combo helpers ---------------------------------------
+// See src/escape.h. These three pieces are the impure half: reading buttons,
+// reading flash, and a flag that survives a warm restart. The decision itself
+// is escapeShouldSwitch(), which is pure and host-tested.
+
+// Survives esp_restart() but not a cold boot, which is the right lifetime for a
+// one-hop loop breaker: two firmwares that both implement this check must not be
+// able to hand the device back and forth while the buttons are held.
+RTC_DATA_ATTR static uint32_t escapeJustSwitchedFlag = 0;
+static constexpr uint32_t kEscapeSwitchMagic = 0x45534301;  // "ESC\x01"
+
+// Same sampling shape as the vendored comboHeld() (RecoveryBoot.cpp:31-45):
+// poll up to 16 times and require 5 consecutive agreeing reads. Duplicated
+// rather than shared because that function is static inside the vendored
+// translation unit, and lib/RecoveryBoot stays byte-for-byte.
+//
+// Firing here costs a reboot, so the confirmation bar is deliberately the same
+// as the one that guards the hatch itself — and since the median-of-three fix
+// in InputManager::getState(), a single bad conversion can no longer break the
+// consecutive run either.
+static bool escapeComboHeld() {
+  InputManager input;
+  input.begin();
+  int consecutive = 0;
+  for (int i = 0; i < 16; ++i) {
+    input.update();
+    const bool held = input.isPressed(InputManager::BTN_BACK) &&
+                      input.isPressed(InputManager::BTN_UP);
+    consecutive = held ? consecutive + 1 : 0;
+    if (consecutive >= 5) return true;
+    delay(6);
+  }
+  return false;
+}
+
+// A partition begins with the ESP image magic. Magic byte and not
+// esp_image_verify(), matching the vendored hasApp(): esp_image_verify rejects
+// the patched vendor images this device family ships.
+static bool escapePartitionHasApp(const esp_partition_t* p) {
+  if (!p) return false;
+  uint8_t magic = 0;
+  return esp_partition_read(p, 0, &magic, sizeof(magic)) == ESP_OK && magic == 0xE9;
+}
+
 void setup() {
   // ---------------------------------------------------------------------------
   // Recovery hatch — MUST stay the first statement in setup().
@@ -310,6 +516,44 @@ void setup() {
   // did before this call existed, so declare the image good as soon as we are
   // running. Harmless no-op when rollback is not enabled.
   esp_ota_mark_app_valid_cancel_rollback();
+
+  // --- The generalised escape, after the vendored one has declined -----------
+  // See src/escape.h for why this exists: the FreeInk combo escapes downward
+  // only, so on every released artifact — which installs into ota_0 — its
+  // fallback is a no-op and the device has no button-reachable way out.
+  //
+  // Reaching this line means the vendored checkBootCombo() did NOT act: it
+  // reboots and never returns when it does. So the only thing left to decide is
+  // whether the combo is still held and whether the other slot is worth going
+  // to.
+  //
+  // Placed AFTER mark_app_valid so that this slot stays the confirmed-good one.
+  // Switching while still PENDING_VERIFY would leave a rollback armed behind us,
+  // which is a second, invisible slot change on the next reset.
+  {
+    EscapeInputs esc;
+    esc.comboHeld = escapeComboHeld();
+    esc.justSwitched = (escapeJustSwitchedFlag == kEscapeSwitchMagic);
+
+    // Clear the one-hop loop breaker whatever happens: it has now been read,
+    // and leaving it set would disarm the next genuine escape.
+    escapeJustSwitchedFlag = 0;
+
+    const esp_partition_t* other = esp_ota_get_next_update_partition(nullptr);
+    esc.otherHasApp = escapePartitionHasApp(other);
+
+    if (escapeShouldSwitch(esc)) {
+      escapeJustSwitchedFlag = kEscapeSwitchMagic;
+      if (freeink::recovery::switchBootPartition(other)) {
+        delay(50);
+        esp_restart();
+      }
+      // The otadata write failed. Nothing has changed, so fall through and boot
+      // normally rather than leaving the user on a blank screen — and drop the
+      // flag again so the next attempt is not treated as a second hop.
+      escapeJustSwitchedFlag = 0;
+    }
+  }
 
   dropLegacyDiagKeys();
 
@@ -365,9 +609,21 @@ void setup() {
   inputSetup();
   fileManagerSetup();
 
+  // TEMPORARY — see src/dev_wipe.h. Reproduces the "fresh install" state by
+  // making the other slot read as empty, so the Recovery flow can be tested
+  // from the state a new user starts in. Armed only by a file on the card, runs
+  // once, and is recoverable because Ardosia carries the hatch in its own
+  // image. Delete this call and src/dev_wipe.* before release.
+  devWipeOtherSlotIfArmed();
+
   // Must run after the card is mounted (fileManagerSetup) and before anything
   // reads a backup: the UI prefs restore below, bleSetup(), and Wi-Fi sync later.
   sdMigrateLegacyBackupDir();
+
+  // And immediately after it, so the rename above cannot carry the old file
+  // forward under the new folder name: the Wi-Fi credential backup is gone for
+  // good (F3). Cheap — one exists() on a card that has already been mounted.
+  wifiSyncMigrateDropSdBackup();
 
   // Restore UI prefs from SD backup if NVS was wiped by a firmware flash
   if (!uiPrefs.isKey("orient")) {
@@ -472,88 +728,240 @@ void enterDeepSleep(SleepReason reason) {
 // Translate physical button presses to HID key codes
 // NOTE: gpio.update() is called in loop() before this function
 // --- Button ladder diagnostic — TEMPORARY -----------------------------------
-// The buttons are an ADC ladder, not digital lines (InputManager.cpp:57). The
-// channel that carries Up and Down decodes ANY value in 1121..3800 as Up — some
-// 65% of the ADC's range — because the ladder only has to tell Up (~2242) from
-// Down (~5) and from rest (~4095). So every transient that pin produces reads
-// as Up, and never as Down, which matches the reported symptom exactly.
+// The buttons are an ADC ladder, not digital lines (InputManager.cpp:57). Both
+// channels decode their lowest band open-ended toward zero, and neither has a
+// "no button" verdict below 3800: on channel 2 anything <= 1120 is Down and
+// 1121..3800 is Up; on channel 1 anything <= 750 is Right and <= 2090 is Left.
 //
-// That is a mechanism, not a proof, and this repository has a history of the
-// obvious hypothesis being wrong. So: record what channel 2 actually does,
-// rather than guess. The readout appears in the Settings footer.
+// A LATENT BUG worth a line of its own, found while reading that table: the
+// bottom band is open to INT32_MIN, so a NEGATIVE reading decodes as Right.
+// adc1_get_raw() on the C3 has no path that returns one today (it blocks for
+// the lock rather than failing, and the C3's single read busy-waits on the DONE
+// flag), so this is not the cause of anything below — but any future error
+// return becomes a silent Right press. Worth closing upstream regardless.
 //
-// Delete this block, buttonDiagText(), its call in drawSettingsMenu and the
-// counter bump below to remove the instrument.
+// Delete this block, buttonDiagText(), buttonDiagActive(), their use in
+// drawSettingsMenu and the buttonDiagSample() call in loop() to remove it.
 static constexpr bool BUTTON_DIAG = true;
 
-// ROUND 2. The first round refuted the obvious idea: at rest the channel sits
-// on 4095 and never wanders into the Up window, so nothing is drifting there on
-// its own. What the readings did show is that Down reads "4, 5, 6 or 4095"
-// while held — the contact is bouncing — and that is the lead:
+// WHAT THE FIRST FOUR ROUNDS SETTLED, so a fifth does not re-ask it.
 //
-//   to get from 5 (Down) back to 4095 (rest) the voltage has to cross
-//   1121..3800, and that IS the Up window.
+// R1  At rest the channels sit on 4095 and do not wander. Nothing drifts.
 //
-// So every bounce of Down sweeps through Up, and boot does the same as the pin
-// charges from 0 to 4095. That would make the phantom Up not spontaneous at all
-// but a shadow of a Down — which fits "I could not catch it jumping by itself".
+// R2  Hypothesised a phantom Up as the shadow of a Down release sweeping back
+//     up through the Up window; instrumented channel 2. Retired: see R3.
 //
-// This round records what the channel was doing AT the moment an Up event was
-// enqueued, and how low it had been just before. A real Up press should fire
-// around 2248 with nothing low behind it; a sweep should fire somewhere else
-// entirely with a ~5 in its recent past.
-static int adcCh2Now = -1;
-static uint16_t upEventsSent = 0;
-
-static constexpr int DIAG_RING = 16;   // ~160 ms of history at the active cadence
-static int diagRing[DIAG_RING];
-static int diagRingPos = 0;
-static bool diagRingFilled = false;
-
-static int upEventAdc = -1;      // channel value when the last Up event fired
-static int upEventPreMin = -1;   // lowest value in the samples just before it
-
-// Has an Up event ever fired with a Down in its recent past? That is the
-// signature of the sweep: the voltage climbing from ~5 back to 4095 crosses the
-// Up window on the way. An honest Up press has ~2248 behind it, never ~5.
+// R3  Three runs refuted the sweep AND the rail/DFS story:
+//       A  keyboard off, navigated with the X4 buttons   lo 5/4095  x4
+//       B  keyboard connected, untouched, 4 min          lo 4095/4095 x0
+//       C  keyboard connected, real typing               lo 5/4095  x4
+//     B kills the radio: connected, radio up, nobody touching, zero
+//     excursions. Not TX sag at +9 dBm, not DFS on the SAR clock, not a
+//     light-sleep transition. Channel 2 never moved in any run, so R1 and R2
+//     were watching a channel with nothing wrong with it — a phantom Right
+//     already READS as Up on list screens, via the Fixed-mode alias
+//     (navUpEdge, below) or, in Natural + LANDSCAPE_CCW, because dpadResolve
+//     sends physical Right straight to Dir::Up (dpad.cpp:44). One cause, two
+//     symptoms, depending on the screen.
 //
-// This is what keeps the instrument silent in daily use: it says nothing until
-// it has actually caught something, and only then takes the footer over. A
-// diagnostic that shouts every day stops being read.
-static bool diagSuspectSeen = false;
+// R4  Also fires on key `3` in the main menu — a BLE keypress, no physical
+//     button touched (input_handler.cpp:568 just moves the selector and sets
+//     screenDirty). That killed the mechanical-contact reading R3 pointed at.
+//     Run, with no arrow touched once, navigating by digits and Esc:
+//       r3 R2 d20-134 lo1 4095 x0 o0
+//
+//     THREE Right presses committed with zero contact: the phantom is real and
+//     it is InputManager's own verdict, not an artefact of this instrument.
+//     o0 says it is Right and only Right — not Up, Down or Left.
+//
+//     But two of those numbers are worthless, and both are my fault:
+//
+//     lo1 4095 x0 is BLIND, not reassuring. The envelope is gated off whenever
+//     a direction is committed — and a committed phantom Right is exactly that
+//     — so it records nothing for the whole press and 250 ms after. Worse, it
+//     sampled from inside processPhysicalButtons(), many calls after
+//     gpio.update() had taken InputManager's own reading, so for a short event
+//     the two conversions need not agree at all.
+//
+//     R2 of r3 has NO DENOMINATOR. While navigating, the device is refreshing
+//     or inside the 150 ms tail for a large share of the time, so 2/3 may just
+//     be the base rate. R was built without its control.
+//
+//     AND d20-134 KILLS BOTH CANDIDATE FIXES. Value cannot separate phantom
+//     from real: a real Right press IS ~5, the floor of channel 1, so there is
+//     no room for a guard band under it. Duration cannot either: a phantom
+//     reached 134 ms, inside human-press territory (~80-150 ms). No debounce
+//     threshold rejects that without rejecting real presses. The plan R4 was
+//     built to serve — measure durations, then pick a debounce — is dead.
+//
+// R5  ANSWERED IT. Run with no arrow touched once, navigating by digits:
+//       r9 R6 f48 v4095-4095 d20-22 o0
+//
+//     v4095-4095: at the instant InputManager committed a Right, a conversion
+//     of the SAME pin taken microseconds later read full rest. The node is not
+//     being pulled down. The voltage is fine and the CONVERSION is the bug.
+//
+//     R6 of r9 is 67% against a base rate f48 of 48% — nine events, six seen
+//     against 4.3 expected. That is the base rate, not a correlation: REFRESH
+//     IS DEAD, and the denominator added this round is what killed it.
+//
+//     d20-22 against R4's d20-134 are the SAME event at two poll cadences: the
+//     delay() ending loop() is 10 ms while recently active and 50 ms idle, so a
+//     2-sample phantom measures ~20 ms active and ~100-150 ms idle. Both runs
+//     say the phantom is always the debounce minimum, two samples. My R4 claim
+//     that duration cannot separate phantom from press was an artefact of
+//     choosing milliseconds, which quantise by a cadence that changes.
+//
+//     Why InputManager's read is bad and this one is not, from the call order:
+//     its channel-1 conversion is preceded by THIS function's from the previous
+//     iteration (ch1 -> ch1, same channel), while this one is preceded by its
+//     channel-2 read (ch2 -> ch1, a switch). The classic first-after-switch
+//     artefact would spoil the switched one. The opposite is observed, so it is
+//     not channel switching. What is left distinguishing them is position:
+//     InputManager's is the first ADC conversion after the delay() at the foot
+//     of loop(), i.e. the first after the CPU wakes from light sleep.
+//
+//     That also explains test B: on the idle 50 ms cadence two consecutive bad
+//     reads are far less likely than on the active 10 ms one, so a device left
+//     alone produces no phantoms — and the correlation with "using a Bluetooth
+//     keyboard" needs no refresh at all, only that typing keeps the cadence at
+//     10 ms.
+//
+// R6  THE FIX IS IN, and this round verifies it rather than hunting. A median
+//     of three conversions per channel now stands in InputManager::getState();
+//     see the comment there for why median and not a longer debounce. The
+//     debounce is deliberately UNCHANGED, so this is one variable.
+//
+//     What to watch: m rising while r stays 0. m is the count of polls where
+//     the three conversions disagreed — the filter catching something. r still
+//     0 with m rising is the fix working. r still 0 with m also 0 means nothing
+//     was caught and nothing happened, which proves nothing either way: keep
+//     using it until m moves. r rising again means a bad read survived a
+//     median of three, and the next step is the debounce after all.
 
+// Mirrors InputManager::ADC_NO_BUTTON, which is private there. Above this the
+// ladder reports no button; at or below it, some button. If that constant moves
+// upstream this has to move with it.
+static constexpr int DIAG_REST_FLOOR = 3800;
+
+static bool diagArmed = false;
+static uint16_t diagRightEdges = 0;      // committed Right presses
+static uint16_t diagRightMinMs = 0xFFFF; // shortest committed Right press
+static uint16_t diagRightMaxMs = 0;      // longest
+static uint16_t diagOtherEdges = 0;      // Up + Down + Left, all three together
+
+static int diagVatEdge = -1;             // channel 1 AT the last committed Right edge
+static int diagVminHeld = -1;            // lowest channel 1 seen DURING a Right press
+
+
+static unsigned long diagRightStartMs = 0;
+
+// Called from loop() immediately after gpio.update(), so this conversion sits
+// as close in time as a second conversion can to the one InputManager just
+// decided on. R4 sampled from inside processPhysicalButtons() instead — many
+// calls later, past bleLoop() and the sync loop — which is why its envelope
+// could disagree with the ladder's verdict about the same event.
+//
+// It reads the button state itself rather than being handed it, so the call
+// site is one line and nothing has to be threaded through.
 static void buttonDiagSample() {
   if (!BUTTON_DIAG) return;
-  const int v = adc1_get_raw(ADC1_CHANNEL_2);
-  adcCh2Now = v;
-  diagRing[diagRingPos] = v;
-  diagRingPos = (diagRingPos + 1) % DIAG_RING;
-  if (diagRingPos == 0) diagRingFilled = true;
-}
 
-// Called wherever an Up event is enqueued, so the evidence is captured at the
-// instant the event happens rather than whenever the screen next redraws.
-static void buttonDiagNoteUp() {
-  if (!BUTTON_DIAG) return;
-  upEventsSent++;
-  upEventAdc = adcCh2Now;
-  const int n = diagRingFilled ? DIAG_RING : diagRingPos;
-  int lowest = 9999;
-  for (int i = 0; i < n; i++) {
-    if (diagRing[i] < lowest) lowest = diagRing[i];
+  const int v1 = adc1_get_raw(ADC1_CHANNEL_1);
+
+  const bool up    = gpio.isPressed(HalGPIO::BTN_UP);
+  const bool down  = gpio.isPressed(HalGPIO::BTN_DOWN);
+  const bool left  = gpio.isPressed(HalGPIO::BTN_LEFT);
+  const bool right = gpio.isPressed(HalGPIO::BTN_RIGHT);
+
+  static bool wasDown[4] = {false, false, false, false};
+  const bool isDown[4] = {up, down, left, right};
+
+  // Arm once the pin has been seen at rest. Boot charges it from 0 up through
+  // every window on the way, so until rest is observed every reading is a boot
+  // artefact. wasDown is synced on the way out so a button held across the
+  // arming moment does not read as an edge on the first armed sample.
+  if (!diagArmed) {
+    if (v1 > DIAG_REST_FLOOR) diagArmed = true;
+    for (int i = 0; i < 4; i++) wasDown[i] = isDown[i];
+    return;
   }
-  upEventPreMin = (n > 0) ? lowest : -1;
-  // 1120 is the top of the Down window in ADC_RANGES_2: anything at or below it
-  // was Down, not Up, so an Up event with that in its history is suspect.
-  if (n > 0 && lowest <= 1120) diagSuspectSeen = true;
+
+  if (right && !wasDown[3]) {
+    if (diagRightEdges < 0xFFFF) diagRightEdges++;
+    diagRightStartMs = millis();
+    // The whole point of this round. NOT gated on anything: the previous round
+    // suppressed exactly this sample because a press was committed, which is
+    // the one condition under which the reading is worth having.
+    diagVatEdge = v1;
+    diagVminHeld = v1;
+  } else if (right) {
+    if (v1 < diagVminHeld) diagVminHeld = v1;   // still held: keep watching
+  }
+
+  if (!right && wasDown[3]) {
+    const unsigned long held = millis() - diagRightStartMs;
+    const uint16_t ms = held > 0xFFFE ? 0xFFFE : static_cast<uint16_t>(held);
+    if (ms < diagRightMinMs) diagRightMinMs = ms;
+    if (ms > diagRightMaxMs) diagRightMaxMs = ms;
+  }
+
+  // The other three together. Expected to stay at zero; the number exists so
+  // that "expected" keeps being checked rather than assumed.
+  for (int i = 0; i < 3; i++) {
+    if (isDown[i] && !wasDown[i] && diagOtherEdges < 0xFFFF) diagOtherEdges++;
+  }
+
+  for (int i = 0; i < 4; i++) wasDown[i] = isDown[i];
 }
 
-bool buttonDiagSuspect() { return BUTTON_DIAG && diagSuspectSeen; }
+// Counters are shown capped at 99, so 99 reads as "99 or more". The cap is
+// about width, not about counting: it makes the line's length bounded by
+// construction. FONT_CHROME_S is jetbrainsmono_9, a monospace with an 11px
+// advance, and the footer's stacked middle column is 396px wide in portrait —
+// exactly 36 characters. A diagnostic whose layout breaks once the numbers get
+// interesting is a diagnostic that fails at the only moment it matters.
+static uint16_t diagShow(const uint16_t v) { return v > 99 ? 99 : v; }
+static uint16_t diagShowMs(const uint16_t v) { return v > 999 ? 999 : v; }
 
-// Shown only once buttonDiagSuspect() is true.
-//   ev<count> @<value when it fired> pre<lowest just before>
-void buttonDiagUpText(char* out, size_t n) {
-  snprintf(out, n, "!up ev%u @%d pre%d", upEventsSent, upEventAdc, upEventPreMin);
+bool buttonDiagActive() { return BUTTON_DIAG; }
+
+// One line for the Settings footer, 31 characters at the cap:
+//
+//   r<committed Right presses>   m<polls where the median had to reject>
+//   v<channel 1 at the last edge>-<lowest channel 1 during that press>
+//   d<shortest>-<longest press, ms>   o<Up + Down + Left edges>
+//
+// R and f are gone: refresh was their question and R6 of r9 against a base
+// rate of 48% answered it no. Their width is what m needed.
+//
+// How to read it:
+//
+//   r0, m rising     the fix is working and it is doing work. This is the one
+//                    reading that distinguishes a fix from a coincidence.
+//   r0, m 0          nothing was caught and nothing happened. Proves nothing
+//                    either way — keep using the device until m moves.
+//   r rising         a bad read survived a median of three. Then the median is
+//                    not enough and DEBOUNCE_DELAY is the next variable.
+//   v high-high      a surviving phantom with the pin at rest: still the
+//                    conversion, and a median of five or a discarded first
+//                    read is the next step rather than the debounce.
+//   v low-low        a surviving phantom with the pin genuinely at the floor.
+//                    That would be a different bug from the one measured, and
+//                    electrical: nothing downstream can tell it from a press.
+//   o above 0        it is not confined to Right after all.
+//
+// v -1 means no Right edge has been seen. d's short end reads 0 when no press
+// has completed.
+void buttonDiagText(char* out, const size_t n) {
+  const uint32_t filtered = InputManager::getFilteredSampleCount();
+  snprintf(out, n, "r%u m%u v%d-%d d%u-%u o%u",
+           diagShow(diagRightEdges),
+           diagShow(filtered > 0xFFFFu ? 0xFFFFu : static_cast<uint16_t>(filtered)),
+           diagVatEdge, diagVminHeld,
+           diagRightMinMs == 0xFFFF ? 0 : diagShowMs(diagRightMinMs),
+           diagShowMs(diagRightMaxMs),
+           diagShow(diagOtherEdges));
 }
 
 // Raise the quick menu for whatever screen is up. Called from the button poll
@@ -589,7 +997,6 @@ static void processPhysicalButtons() {
   bool btnConfirm = gpio.isPressed(HalGPIO::BTN_CONFIRM);
   bool btnBack    = gpio.isPressed(HalGPIO::BTN_BACK);
 
-  buttonDiagSample();
 
   // First call after boot: adopt whatever the buttons are doing as the baseline
   // instead of comparing against a `false` that was never observed. Without
@@ -651,8 +1058,16 @@ static void processPhysicalButtons() {
       if (currentState != UIState::MAIN_MENU) {
         if (currentState == UIState::WIFI_SYNC) {
           // Leaving WIFI_SYNC without this left syncActive true, the radio
-          // up, and deep sleep suppressed forever. With the AP holding
-          // ESP_PM_APB_FREQ_MAX the device would not light-sleep at all.
+          // up, and deep sleep suppressed forever.
+          //
+          // The old comment here said the AP's own ESP_PM_APB_FREQ_MAX lock
+          // meant the device would not light-sleep. That was wrong, and the
+          // hotspot being unusable was the price: those are different lock
+          // types (esp_pm.h:44-54). APB_FREQ_MAX pins the APB clock;
+          // ESP_PM_NO_LIGHT_SLEEP is the one that prevents light sleep, and
+          // nothing held it — so the AP slept between beacons and never
+          // answered DHCP. wifi_sync.cpp now takes the right lock explicitly;
+          // see apHoldAwake() there for the measurements.
           wifiSyncStop();
         } else {
           if (currentState == UIState::TEXT_EDITOR && editorHasUnsavedChanges()) {
@@ -769,7 +1184,6 @@ static void processPhysicalButtons() {
   switch (currentState) {
     case UIState::MAIN_MENU:
       if (navUpEdge) {
-        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
@@ -785,7 +1199,6 @@ static void processPhysicalButtons() {
 
     case UIState::FILE_BROWSER:
       if (navUpEdge && getFileCount() > 0) {
-        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
@@ -876,7 +1289,6 @@ static void processPhysicalButtons() {
       // rotation went in — one axis rotated and the other not, which in Natural
       // landscape had the two pairs obeying different rules on the same screen.
       if (dirEdge[(int)Dir::Up]) {
-        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
@@ -904,7 +1316,6 @@ static void processPhysicalButtons() {
 
     case UIState::PAIRED_KEYBOARDS:
       if (navUpEdge) {
-        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
@@ -924,7 +1335,6 @@ static void processPhysicalButtons() {
 
     case UIState::WIFI_SYNC:
       if (navUpEdge) {
-        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
@@ -948,7 +1358,6 @@ static void processPhysicalButtons() {
       // horizontal one. Up/Down walk the rows, Left/Right the tabs — and both
       // pairs come from dirEdge, so they follow the screen in Natural mode.
       if (dirEdge[(int)Dir::Up]) {
-        buttonDiagNoteUp();
         enqueueKeyEvent(HID_KEY_UP, 0, true);
         enqueueKeyEvent(HID_KEY_UP, 0, false);
       }
@@ -1078,13 +1487,24 @@ void renderSleepScreen() {
 void loop() {
   // --- GPIO first: always poll buttons before anything else ---
   gpio.update();
+  buttonDiagSample();   // TEMPORARY — must stay adjacent to gpio.update(); see BUTTON_DIAG
 
   // Control auto-reconnect based on UI state
   static UIState lastState = UIState::MAIN_MENU;
-  if (currentState == UIState::BLUETOOTH_SETTINGS) {
+  // The hotspot joins Bluetooth settings in holding auto-reconnect off, and for
+  // a measured reason: the C3 has one 2.4 GHz radio, and with a BLE link live
+  // the soft AP's 4-way handshake times out (reason=15) instead of completing.
+  // wifi_sync.cpp drops the link when the AP goes up; this is what stops the
+  // reconnect from bringing it straight back, because this block rewrites the
+  // flag every loop iteration and would otherwise undo it within milliseconds.
+  if (currentState == UIState::BLUETOOTH_SETTINGS ||
+      currentState == UIState::WIFI_SYNC) {
     autoReconnectEnabled = false;
-    // On first entry to BT settings, do a one-shot scan
-    if (lastState != UIState::BLUETOOTH_SETTINGS) {
+    // On first entry to BT settings, do a one-shot scan. Only there — a scan
+    // while the hotspot is up would put the radio back on the air, which is
+    // the whole thing being avoided.
+    if (currentState == UIState::BLUETOOTH_SETTINGS &&
+        lastState != UIState::BLUETOOTH_SETTINGS) {
       cancelPendingConnection();
       startDeviceScan();  // One-shot 5s scan, radio goes quiet after
     }
@@ -1158,6 +1578,11 @@ void loop() {
   if (screenDirty && !renderer.isRefreshing()) {
     updateScreen();
   }
+
+  // Deferred recovery-firmware write. Deliberately after updateScreen() and
+  // gated on the panel being idle, so the row that says "Writing…" is on the
+  // glass before the erase starts. See hatchRequestInstall().
+  if (!screenDirty && !renderer.isRefreshing()) hatchServiceInstall();
 
   // Persist UI settings to NVS when they change (NVS write only on change, not every loop)
   static Orientation lastSavedOrientation = currentOrientation;

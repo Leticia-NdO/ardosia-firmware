@@ -27,7 +27,22 @@
 // the call site does with a yes: one deletes a row of the notes list, the other
 // the note currently open in the editor — which has to disarm the editor before
 // it deletes anything, or the autosave writes the note straight back.
-enum class ConfirmKind : uint8_t { None = 0, DeleteNote, DeleteOpenNote, ForgetKeyboard };
+//
+// RegenerateHotspotPw is the one kind that destroys nothing on the card. It is
+// here because it is irreversible in the way that matters to the person holding
+// the device: the phone and the X3 that already know the hotspot stop being able
+// to join, and there is no screen that can give the old passphrase back.
+enum class ConfirmKind : uint8_t {
+  None = 0,
+  DeleteNote,
+  DeleteOpenNote,
+  ForgetKeyboard,
+  RegenerateHotspotPw,
+  // Overwrites the whole OTHER OTA slot, which on a device with no USB may be
+  // the only firmware the user can escape to. The question names the victim at
+  // the row (hatchOfferText) rather than here, because this string is static.
+  InstallRecovery
+};
 
 // What a key did to the dialog.
 enum class ConfirmReply : uint8_t {

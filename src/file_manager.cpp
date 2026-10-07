@@ -724,6 +724,16 @@ bool noteFilenameIsSafe(const char* filename) {
   return true;
 }
 
+bool noteUriNameIsSafe(const char* name) {
+  if (!noteFilenameIsSafe(name)) return false;
+  if (name[0] == '.') return false;
+  for (const unsigned char* p = (const unsigned char*)name; *p != '\0'; p++) {
+    if (*p == '%') return false;
+    if (*p < 0x20) return false;
+  }
+  return true;
+}
+
 int countNoteFiles() {
   int n = 0;
   auto root = SdMan.open("/notes");

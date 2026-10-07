@@ -61,3 +61,21 @@ uint32_t getScanAgeMs();
 void refreshScanNow();
 void clearAllBluetoothBonds();
 void cancelPendingConnection();
+
+// True while the BLE stack has the shared 2.4 GHz radio: a connect task is in
+// flight, or a scan is running.
+//
+// Exists because cancelPendingConnection() is NOT synchronous — its own comment
+// says "Can't safely kill the task mid-connection, but prevent new attempts".
+// A caller that needs the radio has to WAIT for this to go false, not merely
+// ask for the cancel. Raising the soft AP on top of a live connect task is what
+// made WiFi.softAP() fail outright right after boot, when reconnectDelay is
+// still 5 s and a connect task fires every few seconds.
+bool bleRadioBusy();
+
+// Empty while BLE is healthy; otherwise a short reason the keyboard is not
+// connecting that is not about the keyboard — today, a failed CONNECT_STACK
+// contiguous allocation for the connect task, which is what a fragmented heap
+// after a hotspot session does. For the Bluetooth screen, because that is
+// where someone goes when the keyboard stops working.
+const char* bleNoteText();

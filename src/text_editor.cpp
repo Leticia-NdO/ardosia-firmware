@@ -1,6 +1,7 @@
 #include "text_editor.h"
 #include "utf8_util.h"
 #include <cstring>
+#include <cstdlib>
 #include <algorithm>
 
 // --- Text buffer ---
@@ -10,8 +11,19 @@ static int cursorPosition = 0;
 static int selectionAnchor = 0;
 
 // Lives for the whole boot, so a copy can be pasted into another note.
-// Not on the heap: the C3 fragments, and this buffer is never freed.
-static char clipboard[TEXT_BUFFER_SIZE];
+//
+// It used to be a static array, with the note "not on the heap: the C3
+// fragments, and this buffer is never freed" — a fair point, and the reason
+// this is ONE allocation at the full size on first copy, never realloc'd and
+// never moved. What changed is that 16 KB of static is no longer affordable:
+// the heap ceiling on this device is ~64 KB free and the WiFi AP needs ~50 KB
+// of it (CLAUDE.md bug #7). Taking this out of .bss raises that ceiling for
+// every boot, and a session that never copies anything never pays for it.
+//
+// editorClipboardRelease() hands the 16 KB back while the hotspot is up, which
+// is the one place the margin actually decides whether a feature works. Losing
+// a clipboard there costs a re-copy; it is the cheapest 16 KB on the device.
+static char* clipboard = nullptr;
 static size_t clipboardLen = 0;
 
 // --- File metadata ---
@@ -414,6 +426,13 @@ void editorCopy() {
   if (!selectionActive()) return;
   int lo, hi;
   selectionBounds(&lo, &hi);
+  if (!clipboard) {
+    clipboard = (char*)malloc(TEXT_BUFFER_SIZE);
+    // Nothing to tell the user and nothing to break: the paste below is gated
+    // on clipboardLen, so a failed copy simply leaves the previous clipboard
+    // (or none) in place.
+    if (!clipboard) return;
+  }
   clipboardLen = (size_t)(hi - lo);
   memcpy(clipboard, textBuffer + lo, clipboardLen);
   clipboard[clipboardLen] = '\0';
@@ -430,7 +449,7 @@ void editorCut() {
 }
 
 void editorPaste() {
-  if (readOnly || clipboardLen == 0) return;
+  if (readOnly || !clipboard || clipboardLen == 0) return;
   if (!fitsAfterRemovingSelection(clipboardLen)) return;
 
   removeSelection();
@@ -496,3 +515,9 @@ void editorSetUnsavedChanges(bool v) { unsavedChanges = v; }
 
 bool editorIsReadOnly() { return readOnly; }
 void editorSetReadOnly(bool v) { readOnly = v; }
+
+void editorClipboardRelease() {
+  free(clipboard);
+  clipboard = nullptr;
+  clipboardLen = 0;
+}

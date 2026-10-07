@@ -34,6 +34,8 @@ uint32_t getCurrentPasskey();
 bool isDeviceScanning();
 void refreshScanNow();
 void clearAllBluetoothBonds();
+bool hatchRowActionable();
+void hatchRequestInstall();
 
 // --- Input Queue ---
 static KeyEvent inputQueue[INPUT_QUEUE_SIZE];
@@ -671,6 +673,24 @@ static void dispatchEvent(const KeyEvent& event) {
       // which moves to Shift+Enter — the physical case has four direction
       // buttons and no modifier key, so the tabs have to be reachable from the
       // arrows or they are not reachable at all without a keyboard.
+      // The modal comes first, and it is modal: while it is open no key reaches
+      // the rows or the tabs underneath. Settings never had a dialog before —
+      // regenerating the hotspot passphrase is its first irreversible row.
+      if (confirmDialog.open()) {
+        // Settings now raises two different questions, so the answer has to
+        // be routed by kind. Reading Confirmed as "regenerate the passphrase"
+        // regardless of what was asked is the parallel-array failure mode in a
+        // different costume.
+        const ConfirmKind asked = confirmDialog.kind;
+        const ConfirmReply reply = confirmKey(confirmDialog, event.keyCode, event.modifiers);
+        if (reply == ConfirmReply::Confirmed) {
+          if (asked == ConfirmKind::RegenerateHotspotPw) hotspotRegeneratePassword();
+          else if (asked == ConfirmKind::InstallRecovery) hatchRequestInstall();
+        }
+        if (reply != ConfirmReply::Swallowed) screenDirty = true;
+        break;
+      }
+
       const int rowCount = settingsTabRowCount(settingsTab);
       const SettingsPlace here = settingsPlaceOf(settingsSelection);
       const int pos = here.pos >= 0 ? here.pos : 0;
@@ -739,6 +759,19 @@ static void dispatchEvent(const KeyEvent& event) {
         } else if (settingsSelection == SET_DPAD) {
           dpadMode = (dpadMode == DpadMode::Fixed) ? DpadMode::Natural
                                                    : DpadMode::Fixed;
+        } else if (settingsSelection == SET_INSTALL_HATCH) {
+          // Only asks when there is something to do: the offers that cannot
+          // act explain themselves in the value column, and a dialog whose
+          // only answer is "no" is noise. The question names nothing itself —
+          // the row already named what would be overwritten.
+          if (hatchRowActionable()) {
+            confirmOpen(confirmDialog, ConfirmKind::InstallRecovery, -1);
+          }
+        } else if (settingsSelection == SET_HOTSPOT_PW) {
+          // The only row here that does not cycle a value, and the reason the
+          // dialog above exists. Shift+Enter walks a value backward everywhere
+          // else; there is nothing to walk back, so it asks the same question.
+          confirmOpen(confirmDialog, ConfirmKind::RegenerateHotspotPw, -1);
         }
         screenDirty = true;
 

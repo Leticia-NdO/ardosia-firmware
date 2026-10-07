@@ -165,7 +165,7 @@ static void testSettingsRows() {
   const int rows[] = {SET_DARK_MODE, SET_EDITOR_FONT, SET_FONT_SIZE, SET_WRITING,
                       SET_NOTE_ORDER, SET_SLEEP,      SET_ORIENTATION,
                       SET_KEYBOARD,   SET_BLUETOOTH,  SET_PAIRED_KB,
-                      SET_DPAD};
+                      SET_DPAD,       SET_HOTSPOT_PW, SET_INSTALL_HATCH};
   check((int)(sizeof(rows) / sizeof(rows[0])) == SETTINGS_COUNT,
         "there are exactly SETTINGS_COUNT named rows");
   for (int want = 0; want < SETTINGS_COUNT; want++) {
@@ -249,6 +249,8 @@ static void testSettingsTabs() {
   check(settingsPlaceOf(SET_BLUETOOTH).tab == TAB_CONTROLS, "Bluetooth is a control");
   check(settingsPlaceOf(SET_PAIRED_KB).tab == TAB_CONTROLS, "so are the paired keyboards");
   check(settingsPlaceOf(SET_DPAD).tab == TAB_CONTROLS, "and the d-pad");
+  check(settingsPlaceOf(SET_HOTSPOT_PW).tab == TAB_SYSTEM,
+        "the hotspot password is a system setting");
   check(settingsPlaceOf(SET_KEYBOARD).tab == TAB_CONTROLS, "and the keyboard layout");
 }
 

@@ -5,6 +5,7 @@
 #include "text_editor.h"
 #include "file_manager.h"
 #include "ble_keyboard.h"
+#include <esp_heap_caps.h>
 #include "wifi_sync.h"
 #include "input_handler.h"
 #include "confirm.h"
@@ -400,10 +401,19 @@ static ScreenFrame drawScreenFrame(GfxRenderer& renderer, HalGPIO& gpio,
       const char* rows[2] = {ft.centreA, ft.centreB};
       for (int i = 0; i < 2; i++) {
         if (!rows[i]) continue;
-        const int w = textW(renderer, FONT_CHROME_S, rows[i]);
+        // Clamp to centreW, not to the row's own width. centreW is already
+        // capped at centreMax, so a row wider than the middle column's share
+        // gets CLIPPED here; clipping to w + 4 instead let it draw at full
+        // width and run underneath the left and right columns. On e-ink two
+        // overlapping strings are mush — and a clipped diagnostic is still
+        // recoverable by rotating the device, where the column is 65
+        // characters wide instead of 36.
+        const int tw = textW(renderer, FONT_CHROME_S, rows[i]);
+        const int boxW = tw < centreW ? tw : centreW;
         const int rowTop = foot.boxTop + i * lineStepOf(fInk);
-        drawClippedText(renderer, FONT_CHROME_S, (sw - w) / 2,
-                        textYInBandOf(fInk, rowTop, fInk.height()), rows[i], w + 4, tc);
+        drawClippedText(renderer, FONT_CHROME_S, (sw - boxW) / 2,
+                        textYInBandOf(fInk, rowTop, fInk.height()), rows[i],
+                        tw < centreW ? boxW + 4 : boxW, tc);
       }
     }
   }
@@ -1218,37 +1228,57 @@ void drawRenameScreen(GfxRenderer& renderer, HalGPIO& gpio) {
 }
 
 void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
-  // The raw key readout goes in the middle column. HID usage codes identify a
-  // key by POSITION, so this says what the keyboard actually sent, not what its
-  // keycap claims — the only way to identify a layout without a serial console.
-  // It is one indivisible string, so it never stacks: centreA/B stay null.
+  // The raw key readout. HID usage codes identify a key by POSITION, so this
+  // says what the keyboard actually sent, not what its keycap claims — the only
+  // way to identify a layout without a serial console. Permanent instrument.
   char keyBuf[72];
   inputDescribeLastKey(keyBuf, sizeof(keyBuf));
+
+  // TEMPORARY: the button-ladder readout. See BUTTON_DIAG in main.cpp; removing
+  // it is deleting this block and the stacked assignments below.
+  //
+  // It SHARES the middle column with the key readout rather than replacing it.
+  // The previous round assigned over centreWide, which silently took the key
+  // readout off the screen for as long as the diagnostic had anything to say —
+  // and the key readout is permanent, so that trade was never the right one.
+  // Two instruments do not fit on one line, and the footer already has a
+  // stacked form built for exactly this: centreWide is the one-line version,
+  // centreA/centreB the two-line one, and footerLayoutOf() picks between them
+  // on measured width. With both readouts present it picks two at every real
+  // screen width, and the footer band grows a line to hold them.
+  //
+  // The left column keeps the hints. They are the only thing on this screen
+  // that says the tabs exist, so the diagnostic does not get to have them
+  // either.
+  extern bool buttonDiagActive();
+  extern void buttonDiagText(char* out, size_t n);
+  const bool diag = buttonDiagActive();
+  char diagBuf[64];
+  char wideBuf[144];
+  if (diag) {
+    buttonDiagText(diagBuf, sizeof(diagBuf));
+    snprintf(wideBuf, sizeof(wideBuf), "%s  |  %s", keyBuf, diagBuf);
+  }
+
   FooterText ft;
 
-  // TEMPORARY: the button-ladder readout takes the left column while the
-  // phantom-Up bug is being chased. See BUTTON_DIAG in main.cpp; removing it is
-  // deleting this block and restoring the hint string.
-  //   A2 <now> [<min>..<max>] up?<samples in the Up window> ev<Up events sent>
-  // A min that dips into 1121..3800 while nothing was pressed, or an ev count
-  // that grows on its own, is the proof the hypothesis needs.
-  // The left column is narrow here — the key readout takes the middle — so it
-  // says the one thing this screen does that no other does. U+2039/203A rather
-  // than real arrows: the converted font's charset covers General Punctuation
-  // (verified in the font header), not the arrow block.
-  ft.left = "1-9:Jump  \xE2\x80\xB9\xE2\x80\xBA:Tabs  Esc:Back";
-  ft.centreWide = keyBuf;
-
-  // The phantom-Up hunt lives here, and says nothing until it catches one: an
-  // Up event with a Down in its recent past. Only then does it take the middle
-  // column, because that is the only moment the evidence is worth more than the
-  // key readout. See BUTTON_DIAG in main.cpp.
-  extern bool buttonDiagSuspect();
-  extern void buttonDiagUpText(char* out, size_t n);
-  char diagUpBuf[64];
-  if (buttonDiagSuspect()) {
-    buttonDiagUpText(diagUpBuf, sizeof(diagUpBuf));
-    ft.centreWide = diagUpBuf;
+  // Settings can now raise the confirm box (the Hotspot Password row), and a
+  // modal owns the footer while it is open — the hints under it are for keys
+  // that no longer reach the rows.
+  const bool asking = confirmDialog.open();
+  if (asking) {
+    ft.left = "Enter:Choose  Esc:Cancel";
+  } else {
+    // U+2039/203A rather than real arrows: the converted font's charset covers
+    // General Punctuation (verified in the font header), not the arrow block.
+    ft.left = "1-9:Jump  \xE2\x80\xB9\xE2\x80\xBA:Tabs  Esc:Back";
+    if (diag) {
+      ft.centreWide = wideBuf;
+      ft.centreA = keyBuf;
+      ft.centreB = diagBuf;
+    } else {
+      ft.centreWide = keyBuf;
+    }
   }
   const ScreenFrame box = drawScreenFrame(renderer, gpio, "Settings", ft);
 
@@ -1391,6 +1421,19 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
       }
     } else if (i == SET_DPAD) {
       strcpy(val, dpadMode == DpadMode::Natural ? "Natural" : "Standard");
+    } else if (i == SET_HOTSPOT_PW) {
+      // Not a value — the row's verb. The passphrase itself is NEVER drawn
+      // here: this screen is reachable at any time, and the only place it
+      // belongs is the hotspot screen, where the user is deliberately showing
+      // it to a device they are joining.
+      strcpy(val, "Regenerate");
+    } else if (i == SET_INSTALL_HATCH) {
+      // The row is a state as much as an action: "Install" / "Replace <app>" /
+      // "Installed" / why it cannot. See src/hatch.h — and note it names the
+      // app it would overwrite, because this is the last place that is visible
+      // before the confirm dialog asks.
+      extern void hatchRowText(char* out, size_t n);
+      hatchRowText(val, sizeof(val));
     } else if (i == SET_PAIRED_KB) {
       int kbCount = getPairedKeyboardCount();
       if (kbCount == 0) strcpy(val, "None");
@@ -1411,6 +1454,15 @@ void drawSettingsMenu(GfxRenderer& renderer, HalGPIO& gpio) {
                     sel ? darkMode : !darkMode,
                     sel ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR);
   }
+
+  // The second line of the box is the consequence, in the place the other two
+  // callers put the name of what they are about to destroy. It is SHORTER than
+  // the sentence SPEC-release-blockers.md asks for ("Devices that saved the old
+  // password will stop connecting.") because that one is 56 characters: at
+  // FONT_CHROME_M it inks past 780px and the box is one line, so on a portrait
+  // panel the warning would be clipped to its first three words. This says the
+  // same thing inside the width the box already uses.
+  if (asking) drawConfirmDialog(renderer, confirmDialog, "Saved devices must rejoin.");
 
   renderer.beginRefresh(HalDisplay::FAST_REFRESH);
 }
@@ -1442,6 +1494,10 @@ void drawBluetoothSettings(GfxRenderer& renderer, HalGPIO& gpio) {
     case BLEState::CONNECTING:   status = "Connecting..."; break;
     case BLEState::DISCONNECTED: status = "Not connected"; break;
   }
+  // A real reason outranks the connection state: "Not connected" sends someone
+  // here to press Scan, and Scan cannot fix a heap with no contiguous block
+  // big enough in it. Say what is actually wrong, and what to do about it.
+  if (bleNoteText()[0] != '\0') status = bleNoteText();
   drawClippedText(renderer, FONT_CHROME_S, 10, y, status, sw / 2 - 20, tc);
 
   std::string storedAddr, storedName;
@@ -1819,6 +1875,10 @@ void drawSyncScreen(GfxRenderer& renderer, HalGPIO& gpio) {
       snprintf(buf, sizeof(buf), "Pass: %s", getApPassword());    line(FONT_CHROME_L, buf);
       snprintf(buf, sizeof(buf), "IP: %s", getSyncStatusText());  line(FONT_CHROME_L, buf);
       y += WORKSPACE_PAD;
+      // Temporary-ish instrument: "DHCP: on" is the difference between a server
+      // we know is running and one we hope is. See apDhcpStatusText().
+      apDhcpStatusText(buf, sizeof(buf));                                 line(FONT_CHROME_M, buf);
+      apHttpStatusText(buf, sizeof(buf));                                 line(FONT_CHROME_M, buf);
       snprintf(buf, sizeof(buf), "Clients: %d", getApStationCount());     line(FONT_CHROME_M, buf);
       snprintf(buf, sizeof(buf), "Received: %d", getSyncFilesReceived()); line(FONT_CHROME_M, buf);
       break;

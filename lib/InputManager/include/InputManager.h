@@ -83,6 +83,12 @@ class InputManager {
   // Button names
   static const char* getButtonName(uint8_t buttonIndex);
 
+  // ARDOSIA FORK ADDITION — polls where the three conversions of a channel did
+  // not agree, i.e. where the median filter in getState() had something to
+  // reject. Diagnostic only: it exists so that "the phantom stopped" can be
+  // told apart from "the filter is doing work". Goes when BUTTON_DIAG goes.
+  static uint32_t getFilteredSampleCount();
+
  private:
   int getButtonFromADC(int adcValue, const int ranges[], int numButtons);
 

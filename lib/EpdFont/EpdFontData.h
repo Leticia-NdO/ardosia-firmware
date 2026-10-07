@@ -1,5 +1,22 @@
-// From
-// https://github.com/vroland/epdiy/blob/c61e9e923ce2418150d54f88cea5d196cdc40c54/src/epd_internals.h
+// Copied from epdiy — https://github.com/vroland/epdiy — specifically
+// src/epd_internals.h at commit c61e9e923ce2418150d54f88cea5d196cdc40c54.
+//
+// SPDX-License-Identifier: LGPL-3.0-or-later
+//
+// THIS FILE IS NOT MIT. The rest of this repository is (see ../../LICENSE);
+// this file keeps the licence it came with, and epdiy's root LICENSE at the
+// commit named above is the GNU Lesser General Public License version 3 —
+// verified against that exact commit, not merely against epdiy's current HEAD.
+// The full text is in ../../LICENSES/LGPL-3.0.txt, and the GPL-3.0 text that
+// LGPL-3.0 incorporates by reference is in ../../LICENSES/GPL-3.0.txt.
+//
+// What is here is a data-structure layout: the four structs below describe how
+// a converted font is laid out in flash, and the bitmap headers in
+// builtinFonts/ are generated against them by scripts/fontconvert.py. LGPL-3.0
+// section 3 permits combined works incorporating material of this kind subject
+// to notice, which is what this header and the repository's NOTICE are.
+//
+// Copyright (c) the epdiy authors.
 
 #pragma once
 #include <cstdint>

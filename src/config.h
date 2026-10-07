@@ -73,6 +73,9 @@ static constexpr int MAX_OTA_APPS = 4;
 struct OtaAppEntry {
   char name[32];
   int partitionSubtype;
+  // The slot holds the recovery firmware embedded in this build. Decided once
+  // in detectOtaApps() rather than re-read per redraw; see src/ota_names.h.
+  bool isEmbeddedHatch;
 };
 
 extern OtaAppEntry otaApps[];
@@ -137,7 +140,9 @@ static constexpr int SET_KEYBOARD    = 7;
 static constexpr int SET_BLUETOOTH   = 8;
 static constexpr int SET_PAIRED_KB   = 9;
 static constexpr int SET_DPAD        = 10;
-static constexpr int SETTINGS_COUNT  = 11;
+static constexpr int SET_HOTSPOT_PW = 11;
+static constexpr int SET_INSTALL_HATCH = 12;
+static constexpr int SETTINGS_COUNT  = 13;
 
 // The label belongs next to the index, not in a parallel array a few hundred
 // lines away: reordering the rows used to mean reordering both by hand, and
@@ -156,6 +161,11 @@ inline const char* settingLabel(int row) {
     case SET_BLUETOOTH:   return "Bluetooth";
     case SET_PAIRED_KB:   return "Paired Keyboards";
     case SET_DPAD:        return "D-Pad Keys";
+    case SET_HOTSPOT_PW:  return "Hotspot Password";
+    // "Recovery" and not "Install Escape Hatch": the row is a STATE as much as
+    // an action — it reads "Installed" once the other slot holds it — and the
+    // value column says what choosing it would do.
+    case SET_INSTALL_HATCH: return "Recovery";
     default:              return "";
   }
 }
@@ -221,13 +231,14 @@ inline const char* settingsTabShortLabel(int tab) {
 // from the UI of a device with no serial console and no other way to reach it.
 // The tests sweep it for exactly that.
 inline const int* settingsTabRows(int tab, int& count) {
-  static const int kSystem[]   = {SET_DARK_MODE, SET_ORIENTATION, SET_SLEEP};
+  static const int kSystem[]   = {SET_DARK_MODE, SET_ORIENTATION, SET_SLEEP,
+                                  SET_HOTSPOT_PW, SET_INSTALL_HATCH};
   static const int kEditor[]   = {SET_EDITOR_FONT, SET_FONT_SIZE, SET_WRITING,
                                   SET_NOTE_ORDER};
   static const int kControls[] = {SET_BLUETOOTH, SET_PAIRED_KB, SET_KEYBOARD,
                                   SET_DPAD};
   switch (tab) {
-    case TAB_SYSTEM:   count = 3; return kSystem;
+    case TAB_SYSTEM:   count = 5; return kSystem;
     case TAB_EDITOR:   count = 4; return kEditor;
     case TAB_CONTROLS: count = 4; return kControls;
     default:           count = 0; return nullptr;
@@ -275,6 +286,22 @@ static constexpr int MAX_LINES = 1024;
 //
 // A fourth, FONT_SMALL (ubuntu 10), used to sit here. Once the chrome moved to
 // JetBrains Mono nothing drew with it, so the font left the build.
+//
+// THESE THREE VALUES ARE NOW FROZEN LITERALS, and that is the whole story of
+// them. They came from lib/EpdFont/scripts/build-font-ids.sh, vendored from
+// crosspoint-reader, which derived each one from the SHA256 of FOUR header
+// files — regular, bold, italic and bolditalic at that size. The italics were
+// never included by anything and were deleted along with the other font assets
+// nothing compiled, so the script's inputs no longer exist and the script is
+// gone with them: it could only ever have printed numbers that disagree with
+// these.
+//
+// Nothing is lost by freezing them. The value is a KEY into GfxRenderer's font
+// map and means nothing else — insertFont() in ui_renderer.cpp puts a face
+// under it, editorFontId() looks one up. What it must be is stable and distinct
+// from FONT_CHROME_* (it is: those are positive, these negative), not a hash of
+// anything. Recomputing them over the two surviving files would only rename the
+// keys and rewrite the binary for no behaviour.
 #define FONT_BODY    (-1014561631)   // NOTOSANS_14_FONT_ID
 #define FONT_UI      (-1559651934)   // NOTOSANS_12_FONT_ID
 #define FONT_LARGE   (-1422711852)   // NOTOSANS_16_FONT_ID
@@ -296,10 +323,11 @@ static constexpr int MAX_LINES = 1024;
 // intended size: jetbrainsmono_15 is a 31px font, not a 15px one.
 //
 // The value is only a key into GfxRenderer's font map, so unlike the editor's
-// IDs it is not a hash of anything. build-font-ids.sh derives those from SHA256
-// of the header files; that script is vendored from crosspoint and stays byte
-// for byte, so these are hand-picked instead: 'MON' in the high bytes, the
-// point size in the low one. Nothing can collide — the editor's are negative.
+// IDs it is not a hash of anything: these are hand-picked, 'MON' in the high
+// bytes and the point size in the low one. Nothing can collide — the editor's
+// three are negative and these are positive. (The editor's came from
+// build-font-ids.sh, which hashed the header files; see the note above for why
+// that script is gone and those three are now frozen literals too.)
 // The sizes are NOT the Figma's 11/13/15/22px. Drawn 1:1 the design came out
 // too small to read on this panel, so the text scales ~1.8x while the padding
 // deliberately does not — see the note on ROW_PAD in ui_layout.h. The row label

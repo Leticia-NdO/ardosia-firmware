@@ -1,0 +1,190 @@
+Ardosia
+Copyright (c) 2026 Leticia Neves de Oliveira
+Licensed under the MIT License. See LICENSE.
+
+Ardosia is a fork of MicroSlate and contains code from the projects below.
+Each is used under the licence stated.
+
+Two files in this repository are NOT under the MIT licence of LICENSE; they are
+listed under "Files under other licences" at the end.
+
+--------------------------------------------------------------------------
+Source code included in this repository
+--------------------------------------------------------------------------
+
+MicroSlate
+  https://github.com/Josh-writes/microslate-firmware
+  Copyright (c) 2026 Joshua Hinton
+  MIT License
+  The base of this firmware. Almost all of it comes from here.
+
+CrossPoint Reader
+  https://github.com/crosspoint-reader/crosspoint-reader
+  Copyright (c) 2025 CrossPoint Reader organization
+  MIT License
+  Used in: lib/GfxRenderer, lib/EpdFont, lib/Utf8, lib/hal,
+           lib/SDCardManager (co-author Dave Allie), the partition layout,
+           and the dual-boot conventions.
+  Also the reference for src/sleep_screen.cpp (bitmap sleep screens) and for
+  the 400 ms power-button hold in src/main.cpp.
+
+OpenX4 E-Paper Community SDK
+  https://github.com/open-x4-epaper/community-sdk
+  Copyright (c) 2025 Open X4 E-Paper Contributors
+  MIT License
+  Used in: lib/EInkDisplay, lib/InputManager, lib/SDCardManager
+           (all credited to CidVonHighwind); lib/BatteryMonitor
+           (Serge Baranov <sbaranov@gmail.com>).
+  The e-paper panel initialisation sequences and waveform LUTs originate here.
+
+FreeInk SDK
+  https://github.com/Free-Ink/freeink-sdk
+  Copyright (c) 2026 FreeInk
+  MIT License
+  Used in: lib/RecoveryBoot, vendored byte for byte apart from one include per
+           .cpp (spi_flash_mmap.h -> RecoveryBootCompat.h).
+  The FreeInk SDK is itself based in part on the OpenX4 E-Paper Community SDK
+  listed above, and reproduces its MIT licence in its own NOTICE.
+
+Escape Hatch (recovery firmware), embedded as a binary
+  MIT License
+  Used in: assets/hatch.bin, linked into the firmware image by src/hatch_blob.S
+           and written into the unused OTA slot by src/hatch_flash.cpp.
+  This is a COMPLETE SECOND FIRMWARE carried inside ours, not a library. It is
+  built from the FreeInk SDK above plus the Arduino ESP32 core and ESP-IDF, so
+  everyone released firmware.bin already contains a second copy of all three —
+  all of them already listed in this file, which is why no new licence text
+  appears here. Named separately all the same: a reader who takes our binary
+  apart will find two ESP32 applications in it, and should not have to guess
+  where the second one came from.
+
+CrossInk
+  https://github.com/uxjulia/CrossInk
+  Copyright (c) 2025 Dave Allie, and CrossInk contributors
+  MIT License
+  Adapted in: src/wifi_sync.cpp (the soft access point),
+              src/sleep_screen.cpp, src/sleep_layout.*
+
+--------------------------------------------------------------------------
+Libraries fetched at build time and linked into the firmware
+--------------------------------------------------------------------------
+
+SdFat
+  https://github.com/greiman/SdFat
+  Copyright (c) 2011..2020 Bill Greiman
+  MIT License
+
+esp-nimble-cpp (h2zero)
+  https://github.com/h2zero/esp-nimble-cpp
+  Apache License 2.0
+  Its NOTICE is reproduced verbatim below, as Apache-2.0 section 4(d) requires:
+
+    esp-nimble-cpp
+    NimBLE-Arduino
+    Copyright 2020-2025 Ryan Powell <ryan@nable-embedded.io> and
+    esp-nimble-cpp, NimBLE-Arduino contributors.
+
+    The Initial Developer of some parts of this library, which are copied from,
+    derived from, or inspired by is, esp32-snippets, Copyright 2017 Neil Kolban.
+
+    If this library is used for commercial purposes, it is requested that the user consider
+    making a donation and/or sponsoring this project to support it's ongoing development.
+
+Apache Mynewt NimBLE (the BLE host itself, via ESP-IDF)
+  Apache License 2.0
+  Its NOTICE is reproduced verbatim below, as Apache-2.0 section 4(d) requires:
+
+    Apache Mynewt NimBLE
+    Copyright 2015-2020 The Apache Software Foundation
+    Modifications Copyright 2017-2020 Espressif Systems (Shanghai) CO., LTD.
+
+    This product includes software developed at
+    The Apache Software Foundation (http://www.apache.org/).
+
+    Portions of this software were developed at
+    Runtime Inc, copyright 2015.
+
+Arduino core for ESP32 (Espressif Systems)
+  https://github.com/espressif/arduino-esp32
+  GNU Lesser General Public License v2.1 or later
+  Linked statically into firmware.bin. The complete corresponding source of
+  Ardosia is published under the MIT licence at the repository this NOTICE
+  ships with, together with the exact toolchain and build configuration
+  (platformio.ini, partitions.csv, sdkconfig.defaults), so anyone may modify
+  the library and relink the firmware. See "Relinking" below.
+
+ESP-IDF (Espressif Systems)
+  https://github.com/espressif/esp-idf
+  Apache License 2.0
+  Version 4.4.7, as pinned by platform = espressif32 @ 6.12.0.
+
+--------------------------------------------------------------------------
+Fonts embedded in the firmware (converted to bitmaps)
+--------------------------------------------------------------------------
+
+Both faces below are converted to bitmap tables by
+lib/EpdFont/scripts/fontconvert.py and compiled into firmware.bin. The SIL Open
+Font License requires its text to travel with the font software, so the OFL.txt
+of each face is kept in this repository beside its source TTF, and this NOTICE
+travels with every release binary.
+
+Noto Sans
+  Copyright 2022 The Noto Project Authors
+  SIL Open Font License 1.1
+  lib/EpdFont/builtinFonts/source/NotoSans/OFL.txt
+  The body text of a note. Converted at 12, 14 and 16 pt, regular and bold.
+
+JetBrains Mono
+  Copyright 2020 The JetBrains Mono Project Authors
+  SIL Open Font License 1.1
+  lib/EpdFont/builtinFonts/source/JetBrainsMono/OFL.txt
+  Menus, headers, footers, lists, and the editor's Mono option. Converted at
+  9, 11, 13 and 18 pt regular and bold, and 12, 14 and 16 pt regular.
+
+--------------------------------------------------------------------------
+Files under other licences
+--------------------------------------------------------------------------
+
+epdiy
+  https://github.com/vroland/epdiy
+  GNU Lesser General Public License v3.0
+  Verified against epdiy's root LICENSE at commit
+  c61e9e923ce2418150d54f88cea5d196cdc40c54, the commit the file below cites —
+  not merely against epdiy's current HEAD.
+
+  These two files keep epdiy's licence and are NOT covered by this
+  repository's MIT LICENSE. Both carry an SPDX header saying so:
+
+    lib/EpdFont/EpdFontData.h        the layout of a converted font in flash.
+                                     Compiled into firmware.bin. LGPL-3.0
+                                     section 3 permits a combined work
+                                     incorporating material of this kind
+                                     subject to notice; this is that notice.
+    lib/EpdFont/scripts/fontconvert.py
+                                     the TTF-to-header build tool. NOT shipped
+                                     in the binary; it lives here so the font
+                                     headers can be regenerated.
+
+  Licence texts: LICENSES/LGPL-3.0.txt, and LICENSES/GPL-3.0.txt, which
+  LGPL-3.0 incorporates by reference.
+
+Everything else in this repository is under the MIT licence in LICENSE.
+
+--------------------------------------------------------------------------
+Relinking
+--------------------------------------------------------------------------
+
+arduino-esp32 (LGPL-2.1) and, through ESP-IDF, some LGPL components are linked
+statically into firmware.bin. To rebuild this firmware against a modified copy
+of those libraries:
+
+  1. Install PlatformIO and clone this repository.
+  2. `pio run` — platformio.ini pins platform = espressif32 @ 6.12.0, which
+     pins the arduino-esp32 core and ESP-IDF 4.4.7. Nothing else is required;
+     all first-party libraries are bundled in lib/.
+  3. Replace the framework package under ~/.platformio/packages with your
+     modified copy and run `pio run` again.
+  4. Flash .pio/build/xteink_x4/firmware.bin — see the README. On a
+     USB-locked device this is done from the SD card through the Escape Hatch.
+
+This is not legal advice; it is a statement of what the project provides.

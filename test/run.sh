@@ -65,4 +65,71 @@ $CXX $FLAGS -o /tmp/ardosia_test_quickmenu \
     test_quickmenu.cpp ../src/quickmenu.cpp
 /tmp/ardosia_test_quickmenu || status=1
 
+echo
+$CXX $FLAGS -o /tmp/ardosia_test_hotspot_creds \
+    test_hotspot_creds.cpp ../src/hotspot_creds.cpp
+/tmp/ardosia_test_hotspot_creds || status=1
+
+echo
+$CXX $FLAGS -DRELEASE_BUILD -DARDOSIA_HOST_INPUT -I host_stubs -I ../lib/InputManager/include \
+    -o /tmp/ardosia_test_buttons \
+    test_buttons.cpp ../lib/InputManager/src/InputManager.cpp
+/tmp/ardosia_test_buttons || status=1
+
+echo
+$CXX $FLAGS -I ../src -o /tmp/ardosia_test_escape \
+    test_escape.cpp ../src/escape.cpp
+/tmp/ardosia_test_escape || status=1
+
+echo
+$CXX $FLAGS -I ../src -o /tmp/ardosia_test_hatch \
+    test_hatch.cpp ../src/hatch.cpp
+/tmp/ardosia_test_hatch || status=1
+
+echo
+$CXX $FLAGS -I ../src -o /tmp/ardosia_test_ota_names \
+    test_ota_names.cpp ../src/ota_names.cpp
+/tmp/ardosia_test_ota_names || status=1
+
+echo
+$CXX $FLAGS -I ../src -o /tmp/ardosia_test_note_json \
+    test_note_json.cpp ../src/note_json.cpp
+/tmp/ardosia_test_note_json || status=1
+
+echo
+$CXX $FLAGS -I ../src -o /tmp/ardosia_test_note_html \
+    test_note_html.cpp ../src/note_html.cpp
+/tmp/ardosia_test_note_html || status=1
+
+echo
+$CXX $FLAGS -I ../src -o /tmp/ardosia_test_zip \
+    test_zip.cpp ../src/zip_writer.cpp
+/tmp/ardosia_test_zip || status=1
+
+# The archive the test above just wrote, opened by an INDEPENDENT reader.
+# Asserting my own bytes against my own expectations proves only that I am
+# self-consistent; Python's zipfile verifying the CRCs and handing back the
+# contents proves the output is a ZIP. Skipped in silence without python3, the
+# same way the sanitizers are.
+if command -v python3 >/dev/null 2>&1; then
+  echo
+  python3 ./check-zip.py || status=1
+  # Likewise for the page the test above wrote: an unclosed tag in that <style>
+  # block is a blank page on someone's phone and nothing at all on this device,
+  # which has no way to serve a page to a validator.
+  echo
+  python3 ./check-page.py || status=1
+else
+  echo
+  echo "(python3 unavailable - skipping the independent ZIP and page read-backs)"
+fi
+
+# Not a C++ test: the attribution of every vendored library and build-time
+# dependency. Here because it is the same kind of thing — a property of the tree
+# that nobody re-checks by hand, and whose breakage is invisible until someone
+# downstream finds it.
+echo
+echo "=== NOTICE coverage ==="
+./check-notice.sh || status=1
+
 exit $status
